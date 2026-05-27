@@ -126,7 +126,17 @@ impl<P: RuntimeProvider + Send + Sync> SqliteZoneHandler<P> {
 
         // to be compatible with previous versions, the extension might be zone, not jrnl
         let zone_path = rooted(&config.zone_path, root_dir);
-        let journal_path = rooted(&config.journal_path, root_dir);
+        
+        let journal_path = {
+            let raw = &config.journal_path;
+            let raw_str = raw.to_str().unwrap_or_default();
+            if raw_str.starts_with(':') || raw_str.starts_with("file:") {
+                raw.to_owned()
+            } else {
+                rooted(raw, root_dir)
+            }
+        };
+
 
         #[cfg_attr(not(feature = "__dnssec"), allow(unused_mut))]
         let mut handler = if journal_path.exists() {
