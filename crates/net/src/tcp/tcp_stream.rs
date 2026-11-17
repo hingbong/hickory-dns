@@ -45,6 +45,13 @@ enum WriteTcpState {
     Flushing,
 }
 
+/// Amount of memory reserved up front for a message being read, and the floor for each
+/// subsequent growth step.
+///
+/// The two byte length prefix is chosen by the peer, so the message buffer is grown as data
+/// actually arrives instead of being sized to the full length (up to 64 KiB) immediately.
+const READ_ALLOC_STEP: usize = 1024;
+
 /// Current state of a TCP stream as it's being read.
 pub(crate) enum ReadTcpState {
     /// Currently reading the length of the TCP packet
@@ -60,6 +67,8 @@ pub(crate) enum ReadTcpState {
         pos: usize,
         /// buffer being read into
         bytes: Vec<u8>,
+        /// Total length of the message announced by the length prefix
+        len: usize,
     },
 }
 
@@ -341,14 +350,29 @@ impl<S: DnsTcpStream> Stream for TcpStream<S> {
                     } else {
                         let length = u16::from_be_bytes(*bytes);
                         trace!("got length: {}", length);
-                        let mut bytes = vec![0; length as usize];
-                        bytes.resize(length as usize, 0);
+                        // The length prefix is attacker controlled, so only reserve enough to
+                        // make progress and grow the buffer as bytes actually arrive. The rest
+                        // of the message is allocated in the `ReadTcpState::Bytes` arm below.
+                        let len = usize::from(length);
+                        let capacity = Ord::min(len, READ_ALLOC_STEP);
+                        let bytes = vec![0; capacity];
 
-                        trace!("move ReadTcpState::Bytes: {}", bytes.len());
-                        Some(ReadTcpState::Bytes { pos: 0, bytes })
+                        trace!("move ReadTcpState::Bytes: {}", len);
+                        Some(ReadTcpState::Bytes { pos: 0, bytes, len })
                     }
                 }
-                ReadTcpState::Bytes { pos, bytes } => {
+                ReadTcpState::Bytes { pos, bytes, len } => {
+                    // Grow geometrically, and only once everything received so far has been
+                    // consumed, so a peer that announces a large message but sends little (or
+                    // nothing) never causes the full message to be allocated. `bytes` never
+                    // grows past `len`, so the slice handed to `poll_read` cannot read past
+                    // the end of the announced message.
+                    if *pos == bytes.len() && bytes.len() < *len {
+                        let grown =
+                            Ord::min(*len, bytes.len().saturating_mul(2).max(READ_ALLOC_STEP));
+                        bytes.resize(grown, 0);
+                    }
+
                     let read = ready!(socket.as_mut().poll_read(cx, &mut bytes[*pos..]))?;
                     if read == 0 {
                         // the Stream was closed!
@@ -365,8 +389,8 @@ impl<S: DnsTcpStream> Stream for TcpStream<S> {
                     trace!("in ReadTcpState::Bytes: {}", bytes.len());
                     *pos += read;
 
-                    if *pos < bytes.len() {
-                        trace!("remain ReadTcpState::Bytes: {}", bytes.len());
+                    if *pos < *len {
+                        trace!("remain ReadTcpState::Bytes: {}", *len);
                         None
                     } else {
                         trace!("reset ReadTcpState::LenBytes: {}", 0);
@@ -381,8 +405,10 @@ impl<S: DnsTcpStream> Stream for TcpStream<S> {
             // this will move to the next state,
             //  if it was a completed receipt of bytes, then it will move out the bytes
             if let Some(state) = new_state {
-                if let ReadTcpState::Bytes { pos, bytes } = mem::replace(read_state, state) {
-                    assert_eq!(pos, bytes.len());
+                if let ReadTcpState::Bytes { pos, bytes, len } = mem::replace(read_state, state) {
+                    // The message is only handed off once all announced bytes arrived; the
+                    // buffer is grown to exactly `len` by then, never beyond it.
+                    assert_eq!(pos, len);
                     ret_buf = Some(bytes);
                 }
             }
@@ -404,9 +430,10 @@ impl<S: DnsTcpStream> Stream for TcpStream<S> {
 #[cfg(test)]
 #[cfg(feature = "tokio")]
 mod tests {
-    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use core::time::Duration;
     use std::io;
+    use std::io::Write as _;
 
     use futures_util::StreamExt;
     use test_support::subscribe;
@@ -455,5 +482,121 @@ mod tests {
             panic!("expected an error for the oversized message");
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// Spawns a one-shot raw TCP server on loopback that writes `wire` to the first accepted
+    /// connection and then holds that connection open until the returned sender is dropped.
+    ///
+    /// This bypasses the writer side of [`TcpStream`] so the read side can be fed a hand
+    /// crafted length prefix and payload.
+    fn spawn_raw_server(
+        wire: Vec<u8>,
+    ) -> (
+        SocketAddr,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        let (release, released) = std::sync::mpsc::channel();
+
+        let handle = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.write_all(&wire).unwrap();
+            socket.flush().unwrap();
+            // Keep the connection open while the client is observed in a partial read state.
+            let _ = released.recv_timeout(Duration::from_secs(5));
+        });
+
+        (server_addr, release, handle)
+    }
+
+    /// A full 64 KiB message must still be read end to end now that the buffer grows from
+    /// 1 KiB as data arrives instead of being allocated up front.
+    #[tokio::test]
+    async fn test_tcp_stream_reads_max_length_message() {
+        subscribe();
+        let payload = vec![0xABu8; usize::from(u16::MAX)];
+        let mut wire = Vec::with_capacity(payload.len() + 2);
+        wire.extend_from_slice(&u16::MAX.to_be_bytes());
+        wire.extend_from_slice(&payload);
+
+        let (server_addr, release, server) = spawn_raw_server(wire);
+
+        let tcp = TokioRuntimeProvider::new()
+            .connect_tcp(server_addr, None, None)
+            .await
+            .unwrap();
+        let (mut stream, _sender) = TcpStream::from_stream(tcp, server_addr);
+
+        let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("timed out reading the 64 KiB message")
+            .expect("stream ended before the message was complete")
+            .expect("error reading the 64 KiB message");
+
+        assert_eq!(message.bytes(), payload.as_slice());
+
+        drop(release);
+        server.join().unwrap();
+    }
+
+    /// A message that needs more than one growth step is read in full and returned without
+    /// the trailing slack that the intermediate buffers carry.
+    #[tokio::test]
+    async fn test_tcp_stream_reads_grown_message() {
+        subscribe();
+        let payload = vec![0x5Au8; 10_000];
+        let length = u16::try_from(payload.len()).unwrap();
+        let mut wire = Vec::with_capacity(payload.len() + 2);
+        wire.extend_from_slice(&length.to_be_bytes());
+        wire.extend_from_slice(&payload);
+
+        let (server_addr, release, server) = spawn_raw_server(wire);
+
+        let tcp = TokioRuntimeProvider::new()
+            .connect_tcp(server_addr, None, None)
+            .await
+            .unwrap();
+        let (mut stream, _sender) = TcpStream::from_stream(tcp, server_addr);
+
+        let message = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("timed out reading the 10 KB message")
+            .expect("stream ended before the message was complete")
+            .expect("error reading the 10 KB message");
+
+        assert_eq!(message.bytes(), payload.as_slice());
+
+        drop(release);
+        server.join().unwrap();
+    }
+
+    /// A peer that announces a full sized message but only sends a few bytes must leave the
+    /// reader pending: no panic and no error. The remaining bytes are the upper layer's
+    /// problem (i.e. its timeout), exactly as before.
+    #[tokio::test]
+    async fn test_tcp_stream_waits_for_incomplete_message() {
+        subscribe();
+        let mut wire = Vec::with_capacity(18);
+        wire.extend_from_slice(&u16::MAX.to_be_bytes());
+        wire.extend_from_slice(&[0xCDu8; 16]);
+
+        let (server_addr, release, server) = spawn_raw_server(wire);
+
+        let tcp = TokioRuntimeProvider::new()
+            .connect_tcp(server_addr, None, None)
+            .await
+            .unwrap();
+        let (mut stream, _sender) = TcpStream::from_stream(tcp, server_addr);
+
+        let result = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
+        assert!(
+            result.is_err(),
+            "an incomplete message must not produce a message or an error"
+        );
+
+        drop(release);
+        server.join().unwrap();
     }
 }
