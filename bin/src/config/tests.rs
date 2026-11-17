@@ -578,6 +578,72 @@ fn chained_store_config_error_message() {
 
 #[cfg(feature = "resolver")]
 #[test]
+fn forward_store_active_lookup_options() {
+    fn parse_options(toml: &str) -> hickory_resolver::config::ResolverOpts {
+        let config = toml::from_str::<Config>(toml).expect("config should parse");
+        let ZoneTypeConfig::External(config) = &config.zones[0].zone_type_config else {
+            panic!("expected a forward (external) zone");
+        };
+        let super::ExternalStoreConfig::Forward(forward) = &config.stores[0] else {
+            panic!("expected a forward store");
+        };
+        forward
+            .options
+            .clone()
+            .expect("the forward store should have options")
+    }
+
+    let base = r#"[[zones]]
+zone = "."
+
+[zones.stores]
+type = "forward"
+
+[[zones.stores.name_servers]]
+ip = "8.8.8.8"
+connections = [ { protocol = "udp" } ]
+
+[zones.stores.options]
+timeout = 1
+"#;
+
+    // The new options default to an unbounded table that bypasses deduplication when full.
+    let options = parse_options(base);
+    assert_eq!(options.max_active_lookups, 0);
+    assert_eq!(
+        options.active_lookup_overflow,
+        hickory_resolver::config::ActiveLookupOverflow::Bypass
+    );
+
+    // Explicit values are honored.
+    let options = parse_options(&base.replace(
+        "timeout = 1",
+        "timeout = 1\nmax_active_lookups = 4\nactive_lookup_overflow = \"fail\"",
+    ));
+    assert_eq!(options.max_active_lookups, 4);
+    assert_eq!(
+        options.active_lookup_overflow,
+        hickory_resolver::config::ActiveLookupOverflow::Fail
+    );
+
+    // Unknown overflow policies are rejected.
+    let error = toml::from_str::<Config>(&base.replace(
+        "timeout = 1",
+        "timeout = 1\nactive_lookup_overflow = \"drop\"",
+    ))
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("unknown variant"),
+        "unexpected error: {error}"
+    );
+
+    // Negative lookup limits are rejected.
+    toml::from_str::<Config>(&base.replace("timeout = 1", "timeout = 1\nmax_active_lookups = -1"))
+        .unwrap_err();
+}
+
+#[cfg(feature = "resolver")]
+#[test]
 fn file_store_zone_path() {
     match toml::from_str::<Config>(
         r#"[[zones]]

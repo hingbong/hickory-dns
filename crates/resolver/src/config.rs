@@ -630,6 +630,23 @@ pub struct ResolverOpts {
     /// Defaults to 32. Higher values allow more parallelism but consume more memory.
     #[cfg_attr(feature = "serde", serde(default = "default_max_active_requests"))]
     pub max_active_requests: usize,
+    /// Maximum number of entries in the resolver's in-flight lookup table.
+    ///
+    /// The resolver deduplicates identical concurrent queries by sharing a single upstream
+    /// lookup. This bounds how many distinct lookups can be in flight at once. Queries that
+    /// match an entry already in the table are still shared when the table is full, so they
+    /// are never converted into errors; only new, distinct lookups are affected, according to
+    /// [`active_lookup_overflow`][Self::active_lookup_overflow].
+    ///
+    /// Defaults to 0, which means no limit (the table is unbounded, as in previous releases).
+    #[cfg_attr(feature = "serde", serde(default = "default_max_active_lookups"))]
+    pub max_active_lookups: usize,
+    /// How to handle a new lookup when the in-flight lookup table is full.
+    ///
+    /// Only applies when [`max_active_lookups`][Self::max_active_lookups] is non-zero.
+    /// Defaults to [`ActiveLookupOverflow::Bypass`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub active_lookup_overflow: ActiveLookupOverflow,
     /// Preserve all intermediate records in the lookup response, such as CNAME records
     #[cfg_attr(feature = "serde", serde(default = "default_preserve_intermediates"))]
     pub preserve_intermediates: bool,
@@ -730,6 +747,8 @@ impl Default for ResolverOpts {
             negative_max_ttl: None,
             num_concurrent_reqs: default_num_concurrent_reqs(),
             max_active_requests: default_max_active_requests(),
+            max_active_lookups: default_max_active_lookups(),
+            active_lookup_overflow: ActiveLookupOverflow::default(),
 
             // Defaults to `true` to match the behavior of dig and nslookup.
             preserve_intermediates: default_preserve_intermediates(),
@@ -779,6 +798,10 @@ fn default_max_active_requests() -> usize {
     32
 }
 
+fn default_max_active_lookups() -> usize {
+    0
+}
+
 fn default_preserve_intermediates() -> bool {
     true
 }
@@ -789,6 +812,22 @@ fn default_recursion_desired() -> bool {
 
 fn default_edns_payload_len() -> u16 {
     DEFAULT_MAX_PAYLOAD_LEN
+}
+
+/// How the resolver handles a new lookup when its in-flight lookup table is full.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[non_exhaustive]
+pub enum ActiveLookupOverflow {
+    /// Send the lookup upstream without deduplicating it.
+    ///
+    /// The in-flight lookup table is not modified, so it stays at its configured limit.
+    #[default]
+    Bypass,
+    /// Reject the lookup with a server failure (`SERVFAIL`) response without contacting any
+    /// upstream nameserver.
+    Fail,
 }
 
 /// The lookup ip strategy
@@ -1231,6 +1270,8 @@ mod tests {
         assert_eq!(code.positive_max_ttl, json.positive_max_ttl);
         assert_eq!(code.negative_max_ttl, json.negative_max_ttl);
         assert_eq!(code.num_concurrent_reqs, json.num_concurrent_reqs);
+        assert_eq!(code.max_active_lookups, json.max_active_lookups);
+        assert_eq!(code.active_lookup_overflow, json.active_lookup_overflow);
         assert_eq!(code.preserve_intermediates, json.preserve_intermediates);
         assert_eq!(code.try_tcp_on_error, json.try_tcp_on_error);
         assert_eq!(code.recursion_desired, json.recursion_desired);

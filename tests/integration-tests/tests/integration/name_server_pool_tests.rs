@@ -1,15 +1,17 @@
-use std::future::poll_fn;
+use std::collections::VecDeque;
+use std::future::{Future, poll_fn};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
+use std::pin::Pin;
 use std::slice;
 use std::str::FromStr;
 use std::sync::{
-    Arc,
-    atomic::{AtomicIsize, Ordering},
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicIsize, AtomicUsize, Ordering},
 };
 use std::task::Poll;
 
-use futures::{executor::block_on, future::BoxFuture};
+use futures::{channel::oneshot, executor::block_on, future::BoxFuture};
 
 use hickory_integration::mock_client::*;
 use hickory_net::xfer::DnsHandle;
@@ -17,7 +19,8 @@ use hickory_net::{DnsError, NetError, NoRecords};
 use hickory_proto::op::{DnsResponse, Query, ResponseCode};
 use hickory_proto::rr::{Name, RecordType};
 use hickory_resolver::config::{
-    ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverOpts, ServerOrderingStrategy,
+    ActiveLookupOverflow, ConnectionConfig, NameServerConfig, ProtocolConfig, ResolverOpts,
+    ServerOrderingStrategy,
 };
 use hickory_resolver::{NameServer, NameServerPool, PoolContext, TlsConfig};
 use test_support::subscribe;
@@ -919,4 +922,367 @@ fn test_concurrent_requests_0_conn() {
 
     let response = block_on(future).unwrap();
     assert_eq!(response.answers[0], udp_record);
+}
+
+// === In-flight lookup table limits ===
+
+/// [`OnSend`] implementation that counts the requests handed to the mock nameserver and holds
+/// the first `gated` of them until the test fires the corresponding gate.
+#[derive(Clone)]
+struct GatedOnSend {
+    calls: Arc<AtomicUsize>,
+    gates: Arc<StdMutex<VecDeque<oneshot::Receiver<()>>>>,
+}
+
+impl GatedOnSend {
+    /// Creates a mock [`OnSend`] that holds the first `gated` requests, along with the senders
+    /// used to release them in the order the requests are sent.
+    fn with_gated_requests(gated: usize) -> (Self, Vec<oneshot::Sender<()>>) {
+        let mut senders = Vec::with_capacity(gated);
+        let mut receivers = VecDeque::with_capacity(gated);
+        for _ in 0..gated {
+            let (sender, receiver) = oneshot::channel();
+            senders.push(sender);
+            receivers.push_back(receiver);
+        }
+
+        (
+            Self {
+                calls: Arc::new(AtomicUsize::new(0)),
+                gates: Arc::new(StdMutex::new(receivers)),
+            },
+            senders,
+        )
+    }
+
+    /// Number of requests the mock nameserver has received so far.
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl OnSend for GatedOnSend {
+    fn on_send<E>(
+        &self,
+        response: Result<DnsResponse, E>,
+    ) -> BoxFuture<'static, Result<DnsResponse, E>>
+    where
+        E: From<NetError> + Send + 'static,
+    {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let gate = self.gates.lock().expect("gates mutex poisoned").pop_front();
+
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                let _ = gate.await;
+            }
+            response
+        })
+    }
+}
+
+/// Builds a mock UDP nameserver using the given [`GatedOnSend`] request handler.
+#[cfg(test)]
+fn gated_nameserver(
+    messages: Vec<Result<DnsResponse, NetError>>,
+    options: ResolverOpts,
+    on_send: &GatedOnSend,
+) -> Arc<MockedNameServer<GatedOnSend>> {
+    mock_udp_nameserver_on_send(messages, options, on_send.clone())
+}
+
+/// Yields to the runtime until the mock nameserver has received `expected` requests.
+async fn wait_for_requests(on_send: &GatedOnSend, expected: usize) {
+    for _ in 0..1_000 {
+        if on_send.calls() >= expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+
+    panic!("mock nameserver did not receive {expected} request(s)");
+}
+
+/// Polls `future` once, returning `true` if it is still pending.
+async fn poll_pending<F: Future + Unpin>(future: &mut F) -> bool {
+    poll_fn(|cx| Poll::Ready(Pin::new(&mut *future).poll(cx).is_pending())).await
+}
+
+/// Polls a future that is expected to complete without waiting on any external event,
+/// panicking if it stays pending.
+async fn poll_to_completion<F: Future>(mut future: Pin<Box<F>>) -> F::Output {
+    poll_fn(move |cx| {
+        for _ in 0..32 {
+            if let Poll::Ready(output) = future.as_mut().poll(cx) {
+                return Poll::Ready(output);
+            }
+        }
+
+        panic!("future did not complete without an external event");
+    })
+    .await
+}
+
+/// A full in-flight lookup table with the `fail` policy rejects new lookups with `SERVFAIL`
+/// without contacting any upstream nameserver.
+#[tokio::test]
+async fn test_active_lookup_fail_rejects_new_lookups() {
+    subscribe();
+
+    let first_query = Query::new(Name::from_str("first.example.com.").unwrap(), RecordType::A);
+    let second_query = Query::new(
+        Name::from_str("second.example.com.").unwrap(),
+        RecordType::A,
+    );
+    let first_record = v4_record(first_query.name.clone(), Ipv4Addr::LOCALHOST);
+    let first_response = DnsResponse::from_message(message(
+        first_query.clone(),
+        vec![first_record.clone()],
+        vec![],
+        vec![],
+    ))
+    .unwrap();
+
+    let (on_send, mut gates) = GatedOnSend::with_gated_requests(1);
+    let mut options = ResolverOpts::default();
+    options.max_active_lookups = 1;
+    options.active_lookup_overflow = ActiveLookupOverflow::Fail;
+    let nameserver = gated_nameserver(vec![Ok(first_response)], options.clone(), &on_send);
+    let pool = mock_nameserver_pool_on_send(vec![nameserver], None, options);
+
+    let first_pool = pool.clone();
+    let first = tokio::spawn(async move { first_pool.send(build_request(first_query)).await });
+    wait_for_requests(&on_send, 1).await;
+
+    let error = pool
+        .send(build_request(second_query))
+        .await
+        .expect_err("lookup should be rejected while the in-flight table is full");
+    match error {
+        NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail)) => {}
+        error => panic!("expected a SERVFAIL response code, got {error:#?}"),
+    }
+    assert_eq!(
+        on_send.calls(),
+        1,
+        "a rejected lookup must not reach the upstream nameserver"
+    );
+
+    gates
+        .remove(0)
+        .send(())
+        .expect("the in-flight lookup should still be waiting");
+
+    let response = first
+        .await
+        .expect("lookup task should not panic")
+        .expect("the in-flight lookup should still succeed");
+    assert_eq!(response.answers, [first_record]);
+}
+
+/// Identical lookups are always deduplicated, even when the table is full and the `fail` policy
+/// would reject a new lookup.
+#[tokio::test]
+async fn test_active_lookup_full_shares_existing_lookup() {
+    subscribe();
+
+    let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+    let record = v4_record(query.name.clone(), Ipv4Addr::LOCALHOST);
+    let response =
+        DnsResponse::from_message(message(query.clone(), vec![record.clone()], vec![], vec![]))
+            .unwrap();
+
+    let (on_send, mut gates) = GatedOnSend::with_gated_requests(1);
+    let mut options = ResolverOpts::default();
+    options.max_active_lookups = 1;
+    options.active_lookup_overflow = ActiveLookupOverflow::Fail;
+    let nameserver = gated_nameserver(vec![Ok(response)], options.clone(), &on_send);
+    let pool = mock_nameserver_pool_on_send(vec![nameserver], None, options);
+
+    let first_pool = pool.clone();
+    let first_query = query.clone();
+    let first = tokio::spawn(async move { first_pool.send(build_request(first_query)).await });
+    wait_for_requests(&on_send, 1).await;
+
+    let mut second = Box::pin(pool.send(build_request(query.clone())));
+    assert!(
+        poll_pending(&mut second).await,
+        "an identical lookup should wait on the in-flight lookup"
+    );
+    assert_eq!(
+        on_send.calls(),
+        1,
+        "a shared lookup must not reach the upstream nameserver"
+    );
+
+    gates
+        .remove(0)
+        .send(())
+        .expect("the in-flight lookup should still be waiting");
+
+    let first_response = first
+        .await
+        .expect("lookup task should not panic")
+        .expect("the in-flight lookup should succeed");
+    let second_response = second.await.expect("the shared lookup should succeed");
+    assert_eq!(on_send.calls(), 1);
+    assert_eq!(first_response.answers, [record]);
+    assert_eq!(second_response.answers, [record]);
+}
+
+/// A full in-flight lookup table with the `bypass` policy sends new lookups upstream without
+/// recording them, so the table stays at its limit.
+#[tokio::test]
+async fn test_active_lookup_bypass_sends_new_lookups_upstream() {
+    subscribe();
+
+    let first_query = Query::new(Name::from_str("first.example.com.").unwrap(), RecordType::A);
+    let second_query = Query::new(
+        Name::from_str("second.example.com.").unwrap(),
+        RecordType::A,
+    );
+    let first_record = v4_record(first_query.name.clone(), Ipv4Addr::LOCALHOST);
+    let second_record = v4_record(second_query.name.clone(), Ipv4Addr::new(127, 0, 0, 2));
+    let third_record = v4_record(second_query.name.clone(), Ipv4Addr::new(127, 0, 0, 3));
+    let first_response = DnsResponse::from_message(message(
+        first_query.clone(),
+        vec![first_record.clone()],
+        vec![],
+        vec![],
+    ))
+    .unwrap();
+    let second_response = DnsResponse::from_message(message(
+        second_query.clone(),
+        vec![second_record.clone()],
+        vec![],
+        vec![],
+    ))
+    .unwrap();
+    let third_response = DnsResponse::from_message(message(
+        second_query.clone(),
+        vec![third_record.clone()],
+        vec![],
+        vec![],
+    ))
+    .unwrap();
+
+    // Messages are popped off the back of the mock client, so list them in reverse order.
+    let messages = vec![Ok(third_response), Ok(second_response), Ok(first_response)];
+
+    let (on_send, mut gates) = GatedOnSend::with_gated_requests(2);
+    let mut options = ResolverOpts::default();
+    options.max_active_lookups = 1;
+    options.active_lookup_overflow = ActiveLookupOverflow::Bypass;
+    let nameserver = gated_nameserver(messages, options.clone(), &on_send);
+    let pool = mock_nameserver_pool_on_send(vec![nameserver], None, options);
+
+    let first_pool = pool.clone();
+    let first_query_for_task = first_query.clone();
+    let first =
+        tokio::spawn(async move { first_pool.send(build_request(first_query_for_task)).await });
+    wait_for_requests(&on_send, 1).await;
+
+    // The table is full, so the different lookup is sent upstream instead of being rejected.
+    let mut second = Box::pin(pool.send(build_request(second_query.clone())));
+    assert!(
+        poll_pending(&mut second).await,
+        "a bypassed lookup should wait on the upstream nameserver"
+    );
+    assert_eq!(on_send.calls(), 2);
+
+    // The bypassed lookup was not recorded, so an identical lookup is not deduplicated against
+    // it and also goes upstream.
+    let third = poll_to_completion(Box::pin(pool.send(build_request(second_query.clone())))).await;
+    let third = third.expect("the bypassed lookup should succeed");
+    assert_eq!(third.answers, [third_record]);
+    assert_eq!(on_send.calls(), 3);
+
+    gates
+        .remove(0)
+        .send(())
+        .expect("the first in-flight lookup should still be waiting");
+    gates
+        .remove(0)
+        .send(())
+        .expect("the bypassed lookup should still be waiting");
+
+    let first_response = first
+        .await
+        .expect("lookup task should not panic")
+        .expect("the in-flight lookup should succeed");
+    let second_response = second.await.expect("the bypassed lookup should succeed");
+    assert_eq!(first_response.answers, [first_record]);
+    assert_eq!(second_response.answers, [second_record]);
+}
+
+/// The default (unbounded) table admits every lookup, preserving the previous behavior.
+#[tokio::test]
+async fn test_active_lookup_unbounded_by_default() {
+    subscribe();
+
+    let first_query = Query::new(Name::from_str("first.example.com.").unwrap(), RecordType::A);
+    let second_query = Query::new(
+        Name::from_str("second.example.com.").unwrap(),
+        RecordType::A,
+    );
+    let first_record = v4_record(first_query.name.clone(), Ipv4Addr::LOCALHOST);
+    let second_record = v4_record(second_query.name.clone(), Ipv4Addr::new(127, 0, 0, 2));
+    let first_response = DnsResponse::from_message(message(
+        first_query.clone(),
+        vec![first_record.clone()],
+        vec![],
+        vec![],
+    ))
+    .unwrap();
+    let second_response = DnsResponse::from_message(message(
+        second_query.clone(),
+        vec![second_record.clone()],
+        vec![],
+        vec![],
+    ))
+    .unwrap();
+
+    // Messages are popped off the back of the mock client, so list them in reverse order.
+    let messages = vec![Ok(second_response), Ok(first_response)];
+
+    let (on_send, mut gates) = GatedOnSend::with_gated_requests(2);
+    let options = ResolverOpts::default();
+    assert_eq!(options.max_active_lookups, 0);
+    let nameserver = gated_nameserver(messages, options.clone(), &on_send);
+    let pool = mock_nameserver_pool_on_send(vec![nameserver], None, options);
+
+    let first_pool = pool.clone();
+    let first_query_for_task = first_query.clone();
+    let first =
+        tokio::spawn(async move { first_pool.send(build_request(first_query_for_task)).await });
+    wait_for_requests(&on_send, 1).await;
+
+    // With no limit, the second, distinct lookup is admitted and sent upstream.
+    let mut second = Box::pin(pool.send(build_request(second_query.clone())));
+    assert!(
+        poll_pending(&mut second).await,
+        "an unbounded table should admit the second lookup"
+    );
+    assert_eq!(
+        on_send.calls(),
+        2,
+        "the second lookup should reach the upstream nameserver"
+    );
+
+    gates
+        .remove(0)
+        .send(())
+        .expect("the first in-flight lookup should still be waiting");
+    gates
+        .remove(0)
+        .send(())
+        .expect("the second in-flight lookup should still be waiting");
+
+    let first_response = first
+        .await
+        .expect("lookup task should not panic")
+        .expect("the first lookup should succeed");
+    let second_response = second.await.expect("the second lookup should succeed");
+    assert_eq!(first_response.answers, [first_record]);
+    assert_eq!(second_response.answers, [second_record]);
 }

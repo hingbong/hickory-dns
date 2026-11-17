@@ -32,8 +32,13 @@ use tracing::{debug, error};
 
 #[cfg(any(feature = "__tls", feature = "__quic"))]
 use crate::config::OpportunisticEncryptionConfig;
+#[cfg(feature = "metrics")]
+use crate::metrics::ActiveLookupMetrics;
 use crate::{
-    config::{NameServerConfig, OpportunisticEncryption, ResolverOpts, ServerOrderingStrategy},
+    config::{
+        ActiveLookupOverflow, NameServerConfig, OpportunisticEncryption, ResolverOpts,
+        ServerOrderingStrategy,
+    },
     connection_provider::{ConnectionProvider, TlsConfig},
     name_server::{ConnectionPolicy, NameServer},
     net::{
@@ -59,6 +64,9 @@ use crate::{
 pub struct NameServerPool<P: ConnectionProvider> {
     state: Arc<PoolState<P>>,
     active_requests: Arc<Mutex<HashMap<Arc<CacheKey>, SharedLookup>>>,
+    /// Metrics for the in-flight lookup deduplication table.
+    #[cfg(feature = "metrics")]
+    active_lookup_metrics: ActiveLookupMetrics,
     ttl: Option<TtlInstant>,
     zone: Option<Name>,
 }
@@ -95,6 +103,8 @@ impl<P: ConnectionProvider> NameServerPool<P> {
                 next: AtomicUsize::new(0),
             }),
             active_requests: Arc::new(Mutex::new(HashMap::new())),
+            #[cfg(feature = "metrics")]
+            active_lookup_metrics: ActiveLookupMetrics::default(),
             ttl: None,
             zone: None,
         }
@@ -157,6 +167,10 @@ impl<P: ConnectionProvider> DnsHandle for NameServerPool<P> {
         let state = self.state.clone();
         let acs = self.state.cx.answer_address_filter.clone();
         let active_requests = self.active_requests.clone();
+        let max_active_lookups = self.state.cx.options.max_active_lookups;
+        let active_lookup_overflow = self.state.cx.options.active_lookup_overflow;
+        #[cfg(feature = "metrics")]
+        let active_lookup_metrics = self.active_lookup_metrics.clone();
 
         async move {
             debug!("sending request: {:?}", request.queries);
@@ -167,14 +181,43 @@ impl<P: ConnectionProvider> DnsHandle for NameServerPool<P> {
 
             let key = Arc::new(CacheKey::from_request(&request));
 
-            let (lookup, is_creator) = {
+            let (admission, is_creator) = {
                 let mut active = active_requests.lock();
                 if let Some(existing) = active.get(&key) {
                     debug!(%query, "query currently in progress - returning shared lookup");
-                    (existing.clone(), false)
+                    (LookupAdmission::Shared(existing.clone()), false)
+                } else if max_active_lookups > 0 && active.len() >= max_active_lookups {
+                    #[cfg(feature = "metrics")]
+                    active_lookup_metrics.increment_overflow(active_lookup_overflow);
+
+                    match active_lookup_overflow {
+                        // Do not insert the lookup; send it upstream without deduplicating so
+                        // that the table never grows past its limit.
+                        ActiveLookupOverflow::Bypass => {
+                            debug!(
+                                %query,
+                                max_active_lookups,
+                                "in-flight lookup table full, bypassing deduplication"
+                            );
+                            (LookupAdmission::Direct(Box::new(request)), false)
+                        }
+                        // Reject the lookup without contacting any upstream nameserver.  A busy
+                        // error is deliberately avoided here: `DnsRetryHandle` does not decrement
+                        // its attempts counter for busy errors, so a full table would turn into
+                        // an infinite retry loop instead of a failure.
+                        ActiveLookupOverflow::Fail => {
+                            debug!(
+                                %query,
+                                max_active_lookups,
+                                "in-flight lookup table full, rejecting query"
+                            );
+                            (LookupAdmission::Rejected, false)
+                        }
+                    }
                 } else {
                     debug!(%query, "creating new shared lookup");
 
+                    let state = state.clone();
                     let lookup = async move {
                         match state.try_send(request).await {
                             Ok(response) => Some(Ok(response)),
@@ -186,7 +229,9 @@ impl<P: ConnectionProvider> DnsHandle for NameServerPool<P> {
 
                     let shared_lookup = SharedLookup(lookup);
                     active.insert(key.clone(), shared_lookup.clone());
-                    (shared_lookup, true)
+                    #[cfg(feature = "metrics")]
+                    active_lookup_metrics.set_active_lookups(active.len());
+                    (LookupAdmission::Shared(shared_lookup), true)
                 }
             };
 
@@ -198,9 +243,19 @@ impl<P: ConnectionProvider> DnsHandle for NameServerPool<P> {
             let _cleanup = is_creator.then(|| ActiveRequestCleanup {
                 active_requests: active_requests.clone(),
                 key: key.clone(),
+                #[cfg(feature = "metrics")]
+                active_lookup_metrics: active_lookup_metrics.clone(),
             });
 
-            let response = lookup.await;
+            let response = match admission {
+                LookupAdmission::Shared(lookup) => lookup.await,
+                LookupAdmission::Direct(request) => state.try_send(*request).await,
+                LookupAdmission::Rejected => {
+                    return Err(NetError::Dns(DnsError::ResponseCode(
+                        ResponseCode::ServFail,
+                    )));
+                }
+            };
             let mut response = response?;
 
             for record in response
@@ -1009,6 +1064,22 @@ mod opportunistic_encryption_persistence {
     }
 }
 
+/// How a request was admitted to the in-flight lookup deduplication table.
+enum LookupAdmission {
+    /// The request shares the lookup registered in the table, either as a waiter for an
+    /// existing lookup or as the creator of a new one.
+    Shared(SharedLookup),
+    /// The table is full and the overflow policy bypasses deduplication, so the request is
+    /// sent upstream directly without being recorded.
+    ///
+    /// The request is boxed to keep this enum small; only the uncommon overflow path pays for
+    /// the allocation.
+    Direct(Box<DnsRequest>),
+    /// The table is full and the overflow policy rejects the request without contacting any
+    /// upstream nameserver.
+    Rejected,
+}
+
 /// RAII guard that removes a deduplication key from `active_requests` when dropped.
 ///
 /// This is created only by the "creator" task (the one that inserted the key).
@@ -1018,11 +1089,16 @@ mod opportunistic_encryption_persistence {
 struct ActiveRequestCleanup {
     active_requests: Arc<Mutex<HashMap<Arc<CacheKey>, SharedLookup>>>,
     key: Arc<CacheKey>,
+    #[cfg(feature = "metrics")]
+    active_lookup_metrics: ActiveLookupMetrics,
 }
 
 impl Drop for ActiveRequestCleanup {
     fn drop(&mut self) {
-        self.active_requests.lock().remove(&self.key);
+        let mut active = self.active_requests.lock();
+        active.remove(&self.key);
+        #[cfg(feature = "metrics")]
+        self.active_lookup_metrics.set_active_lookups(active.len());
     }
 }
 

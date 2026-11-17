@@ -17,6 +17,8 @@ use metrics::{
 use hickory_net::NetError;
 use hickory_net::xfer::Protocol;
 
+use crate::config::ActiveLookupOverflow;
+
 #[derive(Clone)]
 pub(crate) struct ResolverMetrics {
     outgoing_queries: ProtocolMetrics,
@@ -199,6 +201,48 @@ impl Default for CacheMetrics {
     }
 }
 
+/// Metrics for the resolver's in-flight lookup deduplication table.
+#[derive(Clone, Debug)]
+pub(crate) struct ActiveLookupMetrics {
+    active_lookups: Gauge,
+}
+
+impl ActiveLookupMetrics {
+    /// Record the current number of entries in the in-flight lookup table.
+    pub(crate) fn set_active_lookups(&self, lookups: usize) {
+        self.active_lookups.set(lookups as f64);
+    }
+
+    /// Record that a lookup could not be deduplicated because the table was full.
+    pub(crate) fn increment_overflow(&self, policy: ActiveLookupOverflow) {
+        let policy = match policy {
+            ActiveLookupOverflow::Bypass => "bypass",
+            ActiveLookupOverflow::Fail => "fail",
+        };
+
+        counter!(ACTIVE_LOOKUPS_OVERFLOW_TOTAL, "policy" => policy).increment(1);
+    }
+}
+
+impl Default for ActiveLookupMetrics {
+    fn default() -> Self {
+        describe_gauge!(
+            ACTIVE_LOOKUPS,
+            Unit::Count,
+            "Number of in-flight resolver lookups tracked for deduplication."
+        );
+        describe_counter!(
+            ACTIVE_LOOKUPS_OVERFLOW_TOTAL,
+            Unit::Count,
+            "Number of resolver lookups that could not be deduplicated because the in-flight lookup table was full, by overflow policy."
+        );
+
+        Self {
+            active_lookups: gauge!(ACTIVE_LOOKUPS),
+        }
+    }
+}
+
 /// Number of outgoing resolver queries by transport protocol.
 pub const OUTGOING_QUERIES_TOTAL: &str = "hickory_resolver_outgoing_queries_total";
 
@@ -216,6 +260,13 @@ pub const CACHE_MISS_DURATION: &str = "hickory_resolver_cache_miss_duration_seco
 
 /// Number of entries in the resolver response cache.
 pub const RESPONSE_CACHE_SIZE: &str = "hickory_resolver_response_cache_size";
+
+/// Number of in-flight resolver lookups tracked for deduplication.
+pub const ACTIVE_LOOKUPS: &str = "hickory_resolver_active_lookups";
+
+/// Number of resolver lookups that could not be deduplicated because the in-flight lookup table
+/// was full, by overflow policy.
+pub const ACTIVE_LOOKUPS_OVERFLOW_TOTAL: &str = "hickory_resolver_active_lookups_overflow_total";
 
 /// Number of queries responses by name server, protocol, and status.
 pub const NAME_SERVER_QUERY_RESPONSES: &str = "hickory_resolver_name_server_query_responses_total";

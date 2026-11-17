@@ -48,6 +48,14 @@ timeout = 20
 positive_max_ttl = 3600
 negative_max_ttl = 3600
 edns_payload_len = 1232
+## Maximum number of distinct in-flight lookups that are tracked for deduplication.  Identical
+## queries that are already in flight always share the existing lookup; the limit only applies to
+## new, distinct lookups.  0 (the default) means no limit.
+#max_active_lookups = 0
+## What to do when max_active_lookups is reached and a new, distinct lookup arrives:
+##   "bypass" sends it upstream without deduplicating it (the table stays at its limit);
+##   "fail" answers it with SERVFAIL without contacting any upstream nameserver.
+#active_lookup_overflow = "bypass"
 ## These options set the answer filter for the forwarder.  Anything listed in deny_answers will be
 ## blocked.  If you need to add a granular exception, you can place an address in allow_answers -
 ## that will override something in deny_answers.  For example, the following configuration blocks
