@@ -687,6 +687,56 @@ impl PersistentStoreMetrics {
     }
 }
 
+/// Metrics describing inbound admission control.
+#[derive(Clone)]
+pub(super) struct AdmissionMetrics {
+    refused: Counter,
+    dropped: Counter,
+    inflight: Gauge,
+}
+
+impl AdmissionMetrics {
+    pub(super) fn new() -> Self {
+        describe_counter!(
+            ADMISSION_REFUSED_TOTAL,
+            Unit::Count,
+            "Number of inbound requests refused with a REFUSED response because the request concurrency limit was reached."
+        );
+        describe_counter!(
+            ADMISSION_DROPPED_TOTAL,
+            Unit::Count,
+            "Number of inbound requests that were dropped without a response because the request concurrency limit was reached."
+        );
+        describe_gauge!(
+            INFLIGHT_REQUESTS,
+            Unit::Count,
+            "Number of inbound requests currently holding an admission permit."
+        );
+
+        Self {
+            refused: counter!(ADMISSION_REFUSED_TOTAL),
+            dropped: counter!(ADMISSION_DROPPED_TOTAL),
+            inflight: gauge!(INFLIGHT_REQUESTS),
+        }
+    }
+
+    pub(super) fn refused(&self) {
+        self.refused.increment(1);
+    }
+
+    pub(super) fn dropped(&self) {
+        self.dropped.increment(1);
+    }
+
+    pub(super) fn inflight_acquired(&self) {
+        self.inflight.increment(1);
+    }
+
+    pub(super) fn inflight_released(&self) {
+        self.inflight.decrement(1);
+    }
+}
+
 /// Indicates whether metrics handles are for requests or responses.
 #[derive(Clone, Copy)]
 enum Direction {
@@ -735,6 +785,15 @@ pub const ZONE_RECORDS_MODIFIED_TOTAL: &str = "hickory_zone_records_modified_tot
 
 /// Number of requests by transport protocol.
 pub const REQUEST_PROTOCOLS_TOTAL: &str = "hickory_request_protocols_total";
+
+/// Number of inbound requests refused by admission control.
+pub const ADMISSION_REFUSED_TOTAL: &str = "hickory_server_admission_refused_total";
+
+/// Number of inbound requests dropped without a response by admission control.
+pub const ADMISSION_DROPPED_TOTAL: &str = "hickory_server_admission_dropped_total";
+
+/// Number of inbound requests currently in flight, i.e. holding an admission permit.
+pub const INFLIGHT_REQUESTS: &str = "hickory_server_inflight_requests";
 
 /// Metrics related to the optional blocklist feature
 #[cfg(feature = "blocklist")]

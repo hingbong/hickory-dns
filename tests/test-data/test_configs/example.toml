@@ -124,3 +124,29 @@ axfr_policy = "Deny"
 # password = ""
 ## specify the algorithm
 # algorithm = "RSASHA256"
+
+## Inbound request admission control.
+##
+## Admission control bounds the number of requests that the server handles
+## concurrently. All transports (UDP, TCP, DoT, DoH and DoQ) share a single
+## limit, which is applied after a request has been parsed and its client has
+## passed the allow/deny checks. A request that arrives while the limit is
+## reached is either answered with REFUSED (the default) or silently dropped,
+## see `overflow` below.
+##
+## max_concurrent_requests: the maximum number of requests handled concurrently.
+##  `0` (the default) disables admission control entirely and preserves the
+##  historical behaviour of the server. A value of 256 is a reasonable starting
+##  point for memory constrained devices, e.g. 512MB routers: it caps how much
+##  per-request memory can be in flight at once.
+##
+##  Note that long running transactions, such as AXFR/IXFR zone transfers, hold
+##  their slot for the whole duration of the transfer.
+##
+## overflow: what to do when the limit is reached. One of:
+##  "refused" (the default) - answer the request with RCODE=REFUSED
+##  "drop"                  - send no response at all
+##  Only used when max_concurrent_requests > 0.
+# [admission]
+# max_concurrent_requests = 256
+# overflow = "refused"

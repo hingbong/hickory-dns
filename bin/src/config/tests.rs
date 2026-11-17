@@ -9,7 +9,9 @@ use toml::map::Keys;
 use toml::value::Array;
 use toml::{Table, Value};
 
-use super::{Config, ServerZoneConfig};
+use hickory_server::server::{AdmissionConfig as ServerAdmissionConfig, OverflowPolicy};
+
+use super::{AdmissionOverflow, Config, ServerZoneConfig};
 #[cfg(feature = "resolver")]
 use super::{FileConfig, ServerStoreConfig, ZoneTypeConfig};
 
@@ -502,6 +504,58 @@ fn test_reject_unknown_fields() {
             }
         }
     }
+}
+
+#[test]
+fn admission_config_defaults() {
+    // Without an [admission] section admission control stays disabled, i.e. the server keeps
+    // handling every request as it did before this setting existed.
+    let config = Config::from_toml("").unwrap();
+    assert_eq!(config.admission.max_concurrent_requests, 0);
+    assert!(matches!(
+        config.admission.overflow,
+        AdmissionOverflow::Refused
+    ));
+
+    // An empty section must be equivalent to leaving it out.
+    let config = Config::from_toml("[admission]").unwrap();
+    assert_eq!(config.admission.max_concurrent_requests, 0);
+    assert!(matches!(
+        config.admission.overflow,
+        AdmissionOverflow::Refused
+    ));
+}
+
+#[test]
+fn admission_config_parse() {
+    let config =
+        Config::from_toml("[admission]\nmax_concurrent_requests = 256\noverflow = \"drop\"\n")
+            .unwrap();
+    assert_eq!(config.admission.max_concurrent_requests, 256);
+    assert!(matches!(config.admission.overflow, AdmissionOverflow::Drop));
+
+    // The binary configuration is converted into the server configuration.
+    let server: ServerAdmissionConfig = config.admission.into();
+    assert_eq!(server.max_concurrent_requests, 256);
+    assert_eq!(server.overflow, OverflowPolicy::Drop);
+}
+
+#[test]
+fn admission_config_rejects_invalid_overflow() {
+    let error = Config::from_toml("[admission]\noverflow = \"refuse\"\n").unwrap_err();
+    assert!(
+        error.to_string().contains("unknown variant"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn admission_config_rejects_unknown_fields() {
+    let error = Config::from_toml("[admission]\nmax_concurrent_request = 16\n").unwrap_err();
+    assert!(
+        error.to_string().contains("unknown field"),
+        "unexpected error: {error}"
+    );
 }
 
 fn server_zone(config: &Config, index: usize) -> &ServerZoneConfig {

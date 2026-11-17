@@ -65,6 +65,7 @@ use hickory_server::store::recursor::RecursiveZoneHandler;
 #[cfg(feature = "sqlite")]
 use hickory_server::store::sqlite::{SqliteConfig, SqliteZoneHandler};
 use hickory_server::{
+    server::{AdmissionConfig as ServerAdmissionConfig, OverflowPolicy as AdmissionOverflowPolicy},
     store::file::{FileConfig, FileZoneHandler},
     zone_handler::{AxfrPolicy, ZoneHandler, ZoneType},
 };
@@ -191,6 +192,9 @@ pub(crate) struct Config {
     /// UDP receive buffer size.
     #[serde(default = "default_udp_receive_buffer_size")]
     pub(crate) udp_receive_buffer_size: u16,
+    /// Inbound request admission control.
+    #[serde(default)]
+    pub(crate) admission: AdmissionConfig,
 }
 
 /// Configuration options for UDP sockets.
@@ -263,6 +267,60 @@ impl Default for TcpSocketConfig {
         Self {
             listen_backlog: default_tcp_listen_backlog(),
             response_buffer_size: default_tcp_response_buffer_size(),
+        }
+    }
+}
+
+/// Inbound request admission control.
+///
+/// Admission control bounds the number of requests that are processed concurrently. All
+/// transports share a single limit, which is applied after a request has been parsed and its
+/// client has passed the access control checks.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AdmissionConfig {
+    /// Maximum number of requests handled concurrently.
+    ///
+    /// Defaults to `0`, which disables admission control and preserves the historical behaviour
+    /// of handling every request. A value of 256 is a reasonable starting point for constrained
+    /// devices.
+    ///
+    /// Note that long-running transactions such as AXFR/IXFR hold a slot for their whole
+    /// duration.
+    #[serde(default)]
+    pub(crate) max_concurrent_requests: usize,
+    /// What to do with a request that arrives while the limit is reached.
+    ///
+    /// Only used when `max_concurrent_requests` is greater than `0`.
+    #[serde(default)]
+    pub(crate) overflow: AdmissionOverflow,
+}
+
+/// The action taken for a request that arrives while the server is at its concurrency limit.
+#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum AdmissionOverflow {
+    /// Answer the request with `RCODE=REFUSED` (the default).
+    #[default]
+    Refused,
+    /// Drop the request without sending any response.
+    Drop,
+}
+
+impl From<AdmissionConfig> for ServerAdmissionConfig {
+    fn from(config: AdmissionConfig) -> Self {
+        Self {
+            max_concurrent_requests: config.max_concurrent_requests,
+            overflow: config.overflow.into(),
+        }
+    }
+}
+
+impl From<AdmissionOverflow> for AdmissionOverflowPolicy {
+    fn from(overflow: AdmissionOverflow) -> Self {
+        match overflow {
+            AdmissionOverflow::Refused => Self::Refused,
+            AdmissionOverflow::Drop => Self::Drop,
         }
     }
 }

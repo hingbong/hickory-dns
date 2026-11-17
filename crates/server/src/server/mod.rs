@@ -37,14 +37,18 @@ use rustls::{ServerConfig, server::ResolvesServerCert};
     feature = "__h3"
 ))]
 use tokio::time::{error::Elapsed, timeout};
-use tokio::{net, task::JoinSet};
+use tokio::{
+    net,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
+};
 #[cfg(feature = "__tls")]
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "metrics")]
-use crate::metrics::ResponseHandlerMetrics;
+use crate::metrics::{AdmissionMetrics, ResponseHandlerMetrics};
 #[cfg(feature = "__h3")]
 use crate::net::h3::h3_server::H3Server;
 #[cfg(feature = "__quic")]
@@ -102,6 +106,29 @@ impl<T: RequestHandler> Server<T> {
         max_payload_size: u16,
         nsid: Option<NSIDPayload>,
     ) -> Self {
+        Self::with_access_and_admission(
+            handler,
+            denied_networks,
+            allowed_networks,
+            max_payload_size,
+            nsid,
+            AdmissionConfig::default(),
+        )
+    }
+
+    /// Creates a new ServerFuture with the specified Handler, denied/allowed networks, and
+    /// inbound admission control settings.
+    ///
+    /// Using the default [`AdmissionConfig`] is equivalent to calling
+    /// [`Server::with_access`].
+    pub fn with_access_and_admission(
+        handler: T,
+        denied_networks: impl IntoIterator<Item = IpNet>,
+        allowed_networks: impl IntoIterator<Item = IpNet>,
+        max_payload_size: u16,
+        nsid: Option<NSIDPayload>,
+        admission: AdmissionConfig,
+    ) -> Self {
         let mut access = AccessControl::default();
         access.insert_deny(denied_networks);
         access.insert_allow(allowed_networks);
@@ -112,6 +139,7 @@ impl<T: RequestHandler> Server<T> {
                 max_payload_size,
                 nsid,
                 access,
+                admission: Admission::new(admission),
                 shutdown: CancellationToken::new(),
             }),
             join_set: JoinSet::new(),
@@ -740,6 +768,128 @@ pub fn default_tls_server_config(
     Ok(config)
 }
 
+/// Configuration for inbound request admission control.
+///
+/// Admission control bounds the number of requests that the request handler processes
+/// concurrently. It is applied after a request has been parsed and its client has passed the
+/// access control checks, so malformed requests, unsupported opcodes and disallowed clients never
+/// occupy a slot. All transports (UDP, TCP, DoT, DoH and DoQ) funnel through that single point.
+///
+/// A request that arrives while the limit is reached is either answered with `REFUSED` or
+/// dropped without a response, see [`OverflowPolicy`]. Permits are released when the handler
+/// future completes *or* when it is dropped, e.g. during shutdown, so the limit can not leak.
+///
+/// Note that long-running transactions, such as AXFR/IXFR zone transfers, hold their permit for
+/// the entire transfer; size `max_concurrent_requests` with those in mind.
+///
+/// The default configuration disables admission control entirely, which matches the behaviour of
+/// earlier releases.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AdmissionConfig {
+    /// The maximum number of requests that may be handled concurrently.
+    ///
+    /// `0` (the default) disables admission control: no semaphore is allocated and requests are
+    /// handled exactly as before.
+    pub max_concurrent_requests: usize,
+    /// The action taken when a request arrives while `max_concurrent_requests` are already in
+    /// flight.
+    ///
+    /// This setting has no effect while `max_concurrent_requests` is `0`.
+    pub overflow: OverflowPolicy,
+}
+
+/// The action taken for an inbound request that arrives while the server is at its configured
+/// concurrency limit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OverflowPolicy {
+    /// Answer the request with `RCODE=REFUSED`, so that the client learns the server is at
+    /// capacity. This is the default.
+    #[default]
+    Refused,
+    /// Send no response at all. This avoids spending resources on a response when the server is
+    /// overloaded, at the cost of the client having to time out.
+    Drop,
+}
+
+/// Admission control state, shared by all transports through [`ServerContext`].
+struct Admission {
+    /// Bounds the number of concurrently handled requests, `None` when admission control is
+    /// disabled.
+    semaphore: Option<Arc<Semaphore>>,
+    /// The action to take when `semaphore` has no permits left.
+    overflow: OverflowPolicy,
+    #[cfg(feature = "metrics")]
+    metrics: AdmissionMetrics,
+}
+
+impl Admission {
+    fn new(config: AdmissionConfig) -> Self {
+        let semaphore = match config.max_concurrent_requests {
+            0 => None,
+            max_concurrent_requests => Some(Arc::new(Semaphore::new(max_concurrent_requests))),
+        };
+
+        Self {
+            semaphore,
+            overflow: config.overflow,
+            #[cfg(feature = "metrics")]
+            metrics: AdmissionMetrics::new(),
+        }
+    }
+
+    /// Attempts to reserve a slot for one request, without ever waiting.
+    ///
+    /// * `Ok(None)` - admission control is disabled, the request may proceed unconstrained.
+    /// * `Ok(Some(permit))` - the request may proceed while the permit is held.
+    /// * `Err(())` - the server is at capacity; the caller applies [`Admission::overflow`].
+    fn try_acquire(&self) -> Result<Option<AdmissionPermit>, ()> {
+        let Some(semaphore) = self.semaphore.as_ref() else {
+            return Ok(None);
+        };
+
+        let permit = Arc::clone(semaphore).try_acquire_owned().map_err(|_| ())?;
+        #[cfg(feature = "metrics")]
+        self.metrics.inflight_acquired();
+
+        Ok(Some(AdmissionPermit {
+            _permit: permit,
+            #[cfg(feature = "metrics")]
+            metrics: self.metrics.clone(),
+        }))
+    }
+
+    /// Records that a request was answered with `REFUSED` because of admission control.
+    fn note_refused(&self) {
+        #[cfg(feature = "metrics")]
+        self.metrics.refused();
+    }
+
+    /// Records that a request was dropped because of admission control.
+    fn note_dropped(&self) {
+        #[cfg(feature = "metrics")]
+        self.metrics.dropped();
+    }
+}
+
+/// A slot reserved for one in-flight request.
+///
+/// The semaphore permit is released when this value is dropped, which includes the request future
+/// being dropped before it completes. When the `metrics` feature is enabled this also keeps the
+/// in-flight gauge accurate.
+struct AdmissionPermit {
+    /// Returning this permit to the semaphore is the whole point of the type.
+    _permit: OwnedSemaphorePermit,
+    #[cfg(feature = "metrics")]
+    metrics: AdmissionMetrics,
+}
+
+#[cfg(feature = "metrics")]
+impl Drop for AdmissionPermit {
+    fn drop(&mut self) {
+        self.metrics.inflight_released();
+    }
+}
+
 struct ServerContext<T> {
     handler: T,
     nsid: Option<NSIDPayload>,
@@ -749,6 +899,7 @@ struct ServerContext<T> {
     /// pseudo-records.
     max_payload_size: u16,
     access: AccessControl,
+    admission: Admission,
     shutdown: CancellationToken,
 }
 
@@ -915,6 +1066,33 @@ impl<T: RequestHandler> ServerContext<T> {
             qtype = query.query_type(),
             class = query.query_class(),
         );
+
+        // Admission control is the single gate for all transports. The error paths above
+        // (malformed messages, unsupported op codes, access control and EDNS version errors)
+        // have already been answered and never occupy a slot.
+        let _admission_permit = match self.admission.try_acquire() {
+            Ok(permit) => permit,
+            Err(()) => {
+                return match self.admission.overflow {
+                    OverflowPolicy::Refused => {
+                        self.admission.note_refused();
+                        Some(error_response(
+                            protocol,
+                            src_addr,
+                            header,
+                            Some(queries),
+                            ResponseCode::Refused,
+                            request.response_edns.as_ref(),
+                            "admission control: server at capacity",
+                        ))
+                    }
+                    OverflowPolicy::Drop => {
+                        self.admission.note_dropped();
+                        None
+                    }
+                };
+            }
+        };
 
         // The reporter will handle making sure to log the result of the request
         let reporter = ResponseReporter {
@@ -1092,7 +1270,9 @@ async fn optional_timeout<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::op::DEFAULT_MAX_PAYLOAD_LEN;
+    use crate::proto::op::{DEFAULT_MAX_PAYLOAD_LEN, HeaderCounts, Message, Query};
+    use crate::proto::rr::{Name, RecordType};
+    use crate::proto::serialize::binary::{BinEncodable, BinEncoder};
     use crate::zone_handler::Catalog;
     use futures_util::future;
     #[cfg(feature = "__tls")]
@@ -1314,5 +1494,198 @@ mod tests {
 
         // this should also return immediately since the task has been aborted
         reap_tasks(&mut joinset);
+    }
+
+    /// A request handler that signals when it is entered and then waits until the test releases
+    /// it, so that a request can be kept in flight while other requests are exercised.
+    struct GatedHandler {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        gate: Arc<Semaphore>,
+    }
+
+    #[async_trait::async_trait]
+    impl RequestHandler for GatedHandler {
+        async fn handle_request<T: crate::net::runtime::Time>(
+            &self,
+            _request: &Request,
+        ) -> ResponseInfo {
+            let _ = self.entered.send(());
+            let _ = self.gate.acquire().await;
+
+            ResponseInfo {
+                header: Header {
+                    metadata: Metadata::new(0x1234, MessageType::Response, OpCode::Query),
+                    counts: HeaderCounts::default(),
+                },
+                cache_ttl: None,
+                bytes: Vec::new(),
+            }
+        }
+    }
+
+    /// Drives one request through the server context, the way a transport task does.
+    async fn dispatch(
+        cx: Arc<ServerContext<GatedHandler>>,
+        bytes: Bytes,
+        src: SocketAddr,
+    ) -> Option<(ResponseInfo, ResponseReporter)> {
+        cx.handle_request(bytes, src, Protocol::Udp).await
+    }
+
+    /// Encodes a minimal, well formed query.
+    fn query_bytes() -> Bytes {
+        let mut message = Message::new(0x1234, MessageType::Query, OpCode::Query);
+        message.add_query(Query::new(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+
+        let mut bytes = Vec::new();
+        message
+            .emit(&mut BinEncoder::new(&mut bytes))
+            .expect("failed to encode query");
+        Bytes::from(bytes)
+    }
+
+    fn admission_context(
+        max_concurrent_requests: usize,
+        overflow: OverflowPolicy,
+    ) -> (
+        Arc<ServerContext<GatedHandler>>,
+        Arc<Semaphore>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+    ) {
+        let (entered, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let gate = Arc::new(Semaphore::new(0));
+
+        let server = Server::with_access_and_admission(
+            GatedHandler {
+                entered,
+                gate: gate.clone(),
+            },
+            [],
+            [],
+            DEFAULT_MAX_PAYLOAD_LEN,
+            None,
+            AdmissionConfig {
+                max_concurrent_requests,
+                overflow,
+            },
+        );
+
+        (server.context.clone(), gate, entered_rx)
+    }
+
+    #[test]
+    fn admission_disabled_never_limits() {
+        let admission = Admission::new(AdmissionConfig::default());
+
+        // Without a limit no semaphore is allocated and callers are told to proceed.
+        for _ in 0..3 {
+            let permit = admission
+                .try_acquire()
+                .expect("disabled admission control can not refuse");
+            assert!(permit.is_none());
+        }
+    }
+
+    #[test]
+    fn admission_limit_is_released_with_the_permit() {
+        let admission = Admission::new(AdmissionConfig {
+            max_concurrent_requests: 1,
+            overflow: OverflowPolicy::Refused,
+        });
+
+        let first = admission.try_acquire().expect("first request is admitted");
+        assert!(first.is_some());
+        assert!(
+            admission.try_acquire().is_err(),
+            "second request must not exceed the limit"
+        );
+
+        // Dropping the permit (e.g. a cancelled request future) releases the slot again.
+        drop(first);
+        let second = admission
+            .try_acquire()
+            .expect("permit is returned when dropped");
+        assert!(second.is_some());
+    }
+
+    #[tokio::test]
+    async fn handle_request_refuses_when_at_capacity() {
+        subscribe();
+
+        let (cx, gate, mut entered) = admission_context(1, OverflowPolicy::Refused);
+        let src: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 53_000));
+        let bytes = query_bytes();
+
+        // The first request takes the single slot and parks inside the handler.
+        let first = tokio::spawn(dispatch(cx.clone(), bytes.clone(), src));
+        entered
+            .recv()
+            .await
+            .expect("first request reached the handler");
+
+        // Error responses are produced before the admission gate, so a malformed request is still
+        // answered with FORMERR while the server is at capacity.
+        let malformed = Bytes::from_static(&[
+            0x00, 0x00, // id
+            0x00, 0x00, // flags: query, opcode QUERY
+            0x00, 0x01, // QDCOUNT: one query, but the message ends here
+            0x00, 0x00, // ANCOUNT
+            0x00, 0x00, // NSCOUNT
+            0x00, 0x00, // ARCOUNT
+        ]);
+        let (info, _reporter) = cx
+            .handle_request(malformed, src, Protocol::Udp)
+            .await
+            .expect("malformed requests are still answered");
+        assert_eq!(info.header.response_code, ResponseCode::FormErr);
+
+        // A well formed request is refused without ever reaching the handler.
+        let (info, _reporter) = cx
+            .handle_request(bytes.clone(), src, Protocol::Udp)
+            .await
+            .expect("a refused request still produces a response");
+        assert_eq!(info.header.response_code, ResponseCode::Refused);
+
+        // Releasing the first request returns the slot to the pool.
+        gate.add_permits(1);
+        let (info, _reporter) = first
+            .await
+            .expect("first request task panicked")
+            .expect("first request produced a response");
+        assert_eq!(info.header.response_code, ResponseCode::NoError);
+
+        let third = tokio::spawn(dispatch(cx.clone(), bytes.clone(), src));
+        entered
+            .recv()
+            .await
+            .expect("slot was released when the first request completed");
+        third.abort();
+        let _ = third.await;
+    }
+
+    #[tokio::test]
+    async fn handle_request_drops_when_at_capacity() {
+        subscribe();
+
+        let (cx, gate, mut entered) = admission_context(1, OverflowPolicy::Drop);
+        let src: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 53_000));
+        let bytes = query_bytes();
+
+        let first = tokio::spawn(dispatch(cx.clone(), bytes.clone(), src));
+        entered
+            .recv()
+            .await
+            .expect("first request reached the handler");
+
+        assert!(
+            cx.handle_request(bytes, src, Protocol::Udp).await.is_none(),
+            "the drop policy must not produce a response"
+        );
+
+        gate.add_permits(1);
+        let _ = first.await.expect("first request task panicked");
     }
 }

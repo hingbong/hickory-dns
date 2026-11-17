@@ -310,6 +310,7 @@ impl DnsServer {
             udp_socket: udp_socket_config,
             tcp_socket: tcp_socket_config,
             udp_receive_buffer_size,
+            admission,
         } = config;
 
         #[cfg(unix)]
@@ -353,12 +354,13 @@ impl DnsServer {
 
         // now, run the server, based on the config
         #[cfg_attr(not(feature = "__tls"), allow(unused_mut))]
-        let mut server = Server::with_access(
+        let mut server = Server::with_access_and_admission(
             catalog,
             deny_networks,
             allow_networks,
             udp_receive_buffer_size,
             nsid,
+            admission.into(),
         );
 
         let mut listen_addrs = listen_addrs_ipv4
