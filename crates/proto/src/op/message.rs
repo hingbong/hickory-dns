@@ -727,8 +727,18 @@ impl<'r> BinDecodable<'r> for Message {
         //  this could improve error detection while decoding.
 
         // get the questions
+        //
+        // QDCOUNT is an attacker controlled u16 taken straight from the header, so the
+        // initial allocation is capped at 8, matching `read_queries` and `read_records`
+        // below. Allocating the full count up front lets a truncated message such as a
+        // bare header with QDCOUNT=65535 reserve (and, once pushed to, commit) memory for
+        // thousands of queries that never arrive. This is the same class of issue as
+        // GHSA-67wc, which capped the answer/authority/additional sections but left the
+        // question section sized from the raw count. The loop below still reads every
+        // counted query, so a message with fewer questions than it claims is rejected
+        // with an error rather than silently truncated.
         let count = counts.queries as usize;
-        let mut queries = Vec::with_capacity(count);
+        let mut queries = Vec::with_capacity(Ord::min(count, 8));
         for _ in 0..count {
             queries.push(Query::read(decoder)?);
         }
@@ -994,6 +1004,100 @@ mod tests {
         ];
 
         assert!(Message::from_bytes(buf).is_err());
+    }
+
+    /// Encodes a lone DNS header claiming `queries` questions, i.e. with no question body.
+    fn header_with_query_count(queries: u16) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = BinEncoder::new(&mut bytes);
+            Header {
+                metadata: Metadata::new(0, MessageType::Query, OpCode::Query),
+                counts: HeaderCounts {
+                    queries,
+                    answers: 0,
+                    authorities: 0,
+                    additionals: 0,
+                },
+            }
+            .emit(&mut encoder)
+            .unwrap();
+        }
+
+        // A bare header is 12 bytes: RFC 1035 section 4.1.1.
+        assert_eq!(bytes.len(), 12);
+        bytes
+    }
+
+    /// The question count comes straight from the header, so a message that claims 65535
+    /// questions while carrying none must be rejected instead of sizing the query `Vec`
+    /// from the unvalidated count.
+    ///
+    /// This is the question section counterpart to GHSA-67wc, which capped the same
+    /// count-driven pre-allocation for the answer, authority and additional sections.
+    #[test]
+    fn test_read_max_qdcount_without_questions() {
+        let bytes = header_with_query_count(u16::MAX);
+
+        let error = Message::from_vec(&bytes).expect_err("no question section was supplied");
+        assert!(matches!(error, DecodeError::InsufficientBytes));
+    }
+
+    /// A message that carries fewer questions than its header claims must run off the end
+    /// of the buffer and fail, i.e. the capped allocation does not turn into a capped read.
+    #[test]
+    fn test_read_max_qdcount_with_truncated_questions() {
+        let mut message = Message::new(0, MessageType::Query, OpCode::Query);
+        message.add_query(Query::new(
+            Name::from_ascii("www.example.com.").unwrap(),
+            RecordType::A,
+        ));
+
+        let mut bytes = Vec::with_capacity(512);
+        {
+            let mut encoder = BinEncoder::new(&mut bytes);
+            message.emit(&mut encoder).unwrap();
+        }
+        bytes[4..6].copy_from_slice(&u16::MAX.to_be_bytes());
+
+        let error = Message::from_vec(&bytes).expect_err("fewer questions than the header claims");
+        assert!(matches!(error, DecodeError::InsufficientBytes));
+    }
+
+    /// A well formed single question message still decodes after the pre-allocation cap.
+    #[test]
+    fn test_read_single_question_roundtrip() {
+        let mut message = Message::new(0, MessageType::Query, OpCode::Query);
+        message.add_query(Query::new(
+            Name::from_ascii("www.example.com.").unwrap(),
+            RecordType::A,
+        ));
+
+        let got = get_message_after_emitting_and_reading(message);
+
+        assert_eq!(got.queries.len(), 1);
+        assert_eq!(
+            got.queries[0].name,
+            Name::from_ascii("www.example.com.").unwrap()
+        );
+    }
+
+    /// The cap is only a capacity hint: a message with more questions than the reserve still
+    /// decodes every one of them. The questions are duplicates because only the count matters
+    /// here and the decoder does not deduplicate.
+    #[test]
+    fn test_read_more_questions_than_preallocated() {
+        let mut message = Message::new(0, MessageType::Query, OpCode::Query);
+        for _ in 0..20 {
+            message.add_query(Query::new(
+                Name::from_ascii("www.example.com.").unwrap(),
+                RecordType::A,
+            ));
+        }
+
+        let got = get_message_after_emitting_and_reading(message);
+
+        assert_eq!(got.queries.len(), 20);
     }
 
     #[test]
