@@ -32,7 +32,7 @@ use crate::{
     xfer::{CONNECT_TIMEOUT, DnsExchange, DnsRequestSender, DnsResponseStream},
 };
 
-use super::{quic_config, quic_stream};
+use super::{QuicTransportOptions, quic_config, quic_stream};
 
 /// A DNS client connection for DNS-over-QUIC
 #[must_use = "futures do nothing unless polled"]
@@ -222,6 +222,23 @@ impl QuicClientStreamBuilder {
         self
     }
 
+    /// Override the QUIC transport parameters used for this connection.
+    ///
+    /// The options are applied on top of the defaults this builder would otherwise use, so the
+    /// protocol specific stream limits are kept for every value that is left unset and explicit
+    /// values take precedence. See [`QuicTransportOptions::apply`] for the validation rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the options contain a value that cannot be used as a QUIC transport
+    /// parameter, e.g. a zero window or a window larger than a QUIC varint.
+    pub fn transport_options(mut self, options: &QuicTransportOptions) -> Result<Self, NetError> {
+        let mut transport_config = default_transport_config();
+        options.apply(&mut transport_config)?;
+        self.transport_config = Arc::new(transport_config);
+        Ok(self)
+    }
+
     /// Creates a new QuicStream to the specified name_server
     ///
     /// # Arguments
@@ -368,15 +385,21 @@ pub(crate) async fn connect_quic(
     })
 }
 
+/// The QUIC transport configuration used by the DNS-over-QUIC client unless it is overridden with
+/// [`QuicClientStreamBuilder::transport_options`].
+fn default_transport_config() -> TransportConfig {
+    let mut transport_config = quic_config::transport();
+    // clients never accept new bidirectional streams
+    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(0));
+
+    transport_config
+}
+
 impl Default for QuicClientStreamBuilder {
     fn default() -> Self {
-        let mut transport_config = quic_config::transport();
-        // clients never accept new bidirectional streams
-        transport_config.max_concurrent_bidi_streams(VarInt::from_u32(0));
-
         Self {
             crypto_config: None,
-            transport_config: Arc::new(transport_config),
+            transport_config: Arc::new(default_transport_config()),
             bind_addr: None,
             connect_timeout: CONNECT_TIMEOUT,
         }

@@ -27,10 +27,12 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 #[cfg(not(feature = "__tls"))]
 use tracing::warn;
 
+#[cfg(feature = "__quic")]
+use crate::config::QuicOpts;
 #[cfg(feature = "__h3")]
 use crate::net::h3::H3ClientStream;
 #[cfg(feature = "__quic")]
-use crate::net::quic::QuicClientStream;
+use crate::net::quic::{QuicClientStream, QuicTransportOptions};
 #[cfg(feature = "__tls")]
 use crate::net::tls::{client_config, default_provider, tls_exchange};
 use crate::{
@@ -169,17 +171,17 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
                     SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
                 });
 
-                Ok(Box::pin(
-                    QuicClientStream::builder()
-                        .crypto_config(tls_config(cx, *disable_sni))
-                        .connect_timeout(cx.options.connect_timeout)
-                        .exchange(
-                            binder.bind_quic(bind_addr, remote_addr)?,
-                            remote_addr,
-                            server_name.clone(),
-                            self.clone(),
-                        ),
-                ))
+                let builder = QuicClientStream::builder()
+                    .crypto_config(tls_config(cx, *disable_sni))
+                    .connect_timeout(cx.options.connect_timeout)
+                    .transport_options(&quic_transport_options(&cx.options.quic))?;
+
+                Ok(Box::pin(builder.exchange(
+                    binder.bind_quic(bind_addr, remote_addr)?,
+                    remote_addr,
+                    server_name.clone(),
+                    self.clone(),
+                )))
             }
             #[cfg(feature = "__h3")]
             (
@@ -196,19 +198,19 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
                     SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
                 });
 
-                Ok(Box::pin(
-                    H3ClientStream::builder()
-                        .crypto_config(tls_config(cx, *disable_sni))
-                        .disable_grease(*disable_grease)
-                        .connect_timeout(cx.options.connect_timeout)
-                        .exchange(
-                            binder.bind_quic(bind_addr, remote_addr)?,
-                            remote_addr,
-                            server_name.clone(),
-                            path.clone(),
-                            self.clone(),
-                        ),
-                ))
+                let builder = H3ClientStream::builder()
+                    .crypto_config(tls_config(cx, *disable_sni))
+                    .disable_grease(*disable_grease)
+                    .connect_timeout(cx.options.connect_timeout)
+                    .transport_options(&quic_transport_options(&cx.options.quic))?;
+
+                Ok(Box::pin(builder.exchange(
+                    binder.bind_quic(bind_addr, remote_addr)?,
+                    remote_addr,
+                    server_name.clone(),
+                    path.clone(),
+                    self.clone(),
+                )))
             }
             #[cfg(feature = "__quic")]
             (ProtocolConfig::Quic { .. }, None) => {
@@ -223,6 +225,21 @@ impl<P: RuntimeProvider> ConnectionProvider for P {
 
     fn runtime_provider(&self) -> &Self::RuntimeProvider {
         self
+    }
+}
+
+/// Translate the user visible QUIC options into the options understood by the QUIC stream
+/// builders.
+#[cfg(feature = "__quic")]
+fn quic_transport_options(opts: &QuicOpts) -> QuicTransportOptions {
+    QuicTransportOptions {
+        stream_receive_window: opts.stream_receive_window,
+        receive_window: opts.receive_window,
+        send_window: opts.send_window,
+        max_idle_timeout: opts.max_idle_timeout,
+        keep_alive_interval: opts.keep_alive_interval,
+        max_concurrent_bidi_streams: opts.max_concurrent_bidi_streams,
+        max_concurrent_uni_streams: opts.max_concurrent_uni_streams,
     }
 }
 

@@ -11,7 +11,11 @@ use toml::{Table, Value};
 
 use super::{Config, ServerZoneConfig};
 #[cfg(feature = "resolver")]
-use super::{FileConfig, ServerStoreConfig, ZoneTypeConfig};
+use super::{
+    ExternalStoreConfig, ExternalZoneConfig, FileConfig, ServerStoreConfig, ZoneTypeConfig,
+};
+#[cfg(feature = "resolver")]
+use hickory_resolver::config::{QuicOpts, ResolverOpts};
 
 #[test]
 fn test_read_config() {
@@ -600,4 +604,97 @@ fn file_store_zone_path() {
         }
         Err(e) => panic!("expected successful parse: {e:?}"),
     }
+}
+
+/// Parse a forwarder configuration whose `[zones.stores.options]` table contains `options`.
+#[cfg(feature = "resolver")]
+fn forwarder_config(options: &str) -> Config {
+    Config::from_toml(&format!(
+        r#"
+[[zones]]
+zone = "."
+[zones.stores]
+type = "forward"
+{options}
+[[zones.stores.name_servers]]
+ip = "8.8.8.8"
+trust_negative_responses = false
+connections = [{{ protocol = "udp" }}]
+"#
+    ))
+    .expect("failed to parse forwarder config")
+}
+
+/// Return the resolver options of the forward store of the first zone.
+#[cfg(feature = "resolver")]
+fn forwarder_options(config: &Config) -> &ResolverOpts {
+    let ZoneTypeConfig::External(ExternalZoneConfig { stores }) = &config.zones[0].zone_type_config
+    else {
+        panic!("expected an external zone");
+    };
+    let ExternalStoreConfig::Forward(forward) = &stores[0] else {
+        panic!("expected a forward store");
+    };
+    forward
+        .options
+        .as_ref()
+        .expect("expected the forward store to have options")
+}
+
+#[cfg(feature = "resolver")]
+#[test]
+fn quic_options_default_to_unset() {
+    // A forwarder that does not mention `quic` keeps every transport parameter at its default.
+    let config = forwarder_config("[zones.stores.options]\ntimeout = 20\n");
+
+    assert_eq!(forwarder_options(&config).quic, QuicOpts::default());
+}
+
+#[cfg(feature = "resolver")]
+#[test]
+fn parses_quic_options() {
+    let config = forwarder_config(
+        r#"
+[zones.stores.options.quic]
+stream_receive_window = 65536
+receive_window = 131072
+send_window = 262144
+max_idle_timeout = 30
+keep_alive_interval = 10
+max_concurrent_bidi_streams = 0
+max_concurrent_uni_streams = 0
+"#,
+    );
+
+    let quic = &forwarder_options(&config).quic;
+    assert_eq!(quic.stream_receive_window, Some(65536));
+    assert_eq!(quic.receive_window, Some(131072));
+    assert_eq!(quic.send_window, Some(262144));
+    assert_eq!(quic.max_idle_timeout, Some(30));
+    assert_eq!(quic.keep_alive_interval, Some(10));
+    assert_eq!(quic.max_concurrent_bidi_streams, Some(0));
+    assert_eq!(quic.max_concurrent_uni_streams, Some(0));
+}
+
+#[cfg(feature = "resolver")]
+#[test]
+fn quic_options_reject_unknown_fields() {
+    let error = Config::from_toml(
+        r#"
+[[zones]]
+zone = "."
+[zones.stores]
+type = "forward"
+[zones.stores.options.quic]
+extra = 1
+[[zones.stores.name_servers]]
+ip = "8.8.8.8"
+trust_negative_responses = false
+connections = [{ protocol = "udp" }]
+"#,
+    )
+    .unwrap_err()
+    .to_string();
+
+    assert!(error.contains("unknown field `extra`"), "{error}");
 }

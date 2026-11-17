@@ -54,3 +54,29 @@ edns_payload_len = 1232
 ## any record containing an RFC-1918 address *except* 192.168.1.1.
 #allow_answers = ["192.168.1.1/32"]
 #deny_answers = ["10.0.0.0/8", "172.16.0.0/12", "192.168.1.0/24"]
+
+## QUIC transport tuning.  These knobs are only used by the "quic" (DoQ) and "h3" (DoH3)
+## protocols when they are configured for a name server above; they are ignored for the other
+## transports.  Every value is optional: leaving it out keeps the default listed below, so the
+## commented out table below is equivalent to the current behaviour.
+#[zones.stores.options.quic]
+## Bytes the peer may send on a single stream before it has to wait for flow control credit.
+## Must be greater than zero and no larger than receive_window.  Default: 1250000 (quinn).
+#stream_receive_window = 65536
+## Bytes the peer may send across the whole connection before it has to wait.
+## Must be greater than zero.  Default: 4611686018427387903 (VarInt::MAX, no limit).
+#receive_window = 131072
+## Bytes we may keep buffered for data that we wrote but the peer has not acknowledged yet.
+## Must be greater than zero.  Default: 10000000.
+#send_window = 262144
+## Seconds of inactivity before the connection is considered dead; 0 disables the timeout.
+## Default: 30.
+#max_idle_timeout = 30
+## Seconds between keep-alive packets; 0 or unset disables them.  Default: disabled.
+#keep_alive_interval = 10
+## How many bidirectional streams the peer may open towards us.  This is not a limit on how
+## many queries we send at once.  Default: 0 for DoQ, 3 for H3.
+#max_concurrent_bidi_streams = 0
+## How many unidirectional streams the peer may open towards us.
+## Default: 0 for DoQ, 4 for H3 (control, QPACK encoder/decoder and GREASE streams).
+#max_concurrent_uni_streams = 0

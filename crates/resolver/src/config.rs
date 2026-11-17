@@ -556,6 +556,71 @@ impl ProtocolConfig {
     }
 }
 
+/// QUIC transport parameters for DNS over QUIC (DoQ) and DNS over HTTP/3 (DoH3).
+///
+/// Every field is optional: a field that is left unset keeps the value Hickory would otherwise
+/// use. Hickory starts from quinn's default `TransportConfig` (1,250,000 byte stream receive
+/// window, `VarInt::MAX` connection receive window, 10,000,000 byte send window, 30 second idle
+/// timeout and no keep-alives) and only changes the protocol specific stream limits: DoQ forbids
+/// the peer from opening streams (0 bidirectional, 0 unidirectional), H3 allows the streams its
+/// control and QPACK streams need (3 bidirectional, 4 unidirectional).
+///
+/// These settings only apply to the `quic` and `h3` protocols and are ignored by the other
+/// transports.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(Serialize, Deserialize),
+    serde(deny_unknown_fields)
+)]
+pub struct QuicOpts {
+    /// Maximum number of bytes the peer may transmit on a single stream before it must wait for
+    /// flow control credit.
+    ///
+    /// Must be greater than zero, at most `VarInt::MAX` (2^62 - 1) and should not exceed
+    /// `receive_window`. Defaults to 1,250,000 bytes when unset.
+    pub stream_receive_window: Option<u64>,
+
+    /// Maximum number of bytes the peer may transmit across all streams of a connection before it
+    /// must wait for flow control credit.
+    ///
+    /// Must be greater than zero and at most `VarInt::MAX`. Defaults to `VarInt::MAX` when unset.
+    ///
+    /// Note that this bounds the whole connection: lowering it below the stream receive window
+    /// default (1,250,000 bytes) is only detected when `stream_receive_window` is set as well,
+    /// because the effective quinn default cannot be read back from the transport configuration.
+    pub receive_window: Option<u64>,
+
+    /// Maximum number of bytes of outgoing data that may be buffered while waiting for the peer to
+    /// acknowledge it.
+    ///
+    /// Must be greater than zero and at most `VarInt::MAX`. Defaults to 10,000,000 bytes when
+    /// unset. Lowering it bounds the memory used by in flight queries on a connection.
+    pub send_window: Option<u64>,
+
+    /// Number of seconds of inactivity after which the connection is considered dead.
+    ///
+    /// `0` disables the idle timeout. Defaults to 30 seconds when unset.
+    pub max_idle_timeout: Option<u64>,
+
+    /// Number of seconds of inactivity after which a keep-alive packet is sent to the peer.
+    ///
+    /// `0` or leaving the field unset disables keep-alives, which is the default.
+    pub keep_alive_interval: Option<u64>,
+
+    /// Maximum number of concurrent bidirectional streams the peer may open towards us.
+    ///
+    /// This limits the streams the remote endpoint may initiate; it is not a limit on how many
+    /// queries we send concurrently, since every DoQ query uses its own client initiated
+    /// bidirectional stream. Defaults to 0 for DoQ and 3 for H3 when unset.
+    pub max_concurrent_bidi_streams: Option<u64>,
+
+    /// Maximum number of concurrent unidirectional streams the peer may open towards us.
+    ///
+    /// Defaults to 0 for DoQ and 4 for H3 when unset.
+    pub max_concurrent_uni_streams: Option<u64>,
+}
+
 /// Configuration for the Resolver
 #[derive(Debug, Clone)]
 #[cfg_attr(
@@ -687,6 +752,11 @@ pub struct ResolverOpts {
         serde(default = "default_connect_timeout", with = "duration")
     )]
     pub connect_timeout: Duration,
+    /// QUIC transport parameters for DNS over QUIC and DNS over HTTP/3.
+    ///
+    /// Unset values keep Hickory's defaults, see [`QuicOpts`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub quic: QuicOpts,
     /// Report the IP of the name server for query result metrics.
     ///
     /// When `false`, metrics are aggregated under a static "aggregate" address label to avoid
@@ -745,6 +815,7 @@ impl Default for ResolverOpts {
             deny_answers: vec![],
             edns_payload_len: default_edns_payload_len(),
             connect_timeout: default_connect_timeout(),
+            quic: QuicOpts::default(),
             #[cfg(feature = "metrics")]
             enable_per_name_server_metrics: false,
         }
@@ -1240,6 +1311,8 @@ mod tests {
         assert_eq!(code.case_randomization, json.case_randomization);
         assert_eq!(code.trust_anchor, json.trust_anchor);
         assert_eq!(code.connect_timeout, json.connect_timeout);
+        assert_eq!(code.quic, QuicOpts::default());
+        assert_eq!(code.quic, json.quic);
         #[cfg(feature = "metrics")]
         assert_eq!(
             code.enable_per_name_server_metrics,

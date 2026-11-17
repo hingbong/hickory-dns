@@ -29,7 +29,7 @@ use crate::error::NetError;
 use crate::http::{HttpSender, RequestContext, SetHeaders, Version, fetch_body};
 use crate::proto::ProtoError;
 use crate::proto::op::DnsRequest;
-use crate::quic::connect_quic;
+use crate::quic::{QuicTransportOptions, connect_quic};
 use crate::runtime::{RuntimeProvider, Spawn};
 use crate::tls::client_config;
 use crate::udp::UdpSocket;
@@ -178,6 +178,23 @@ impl H3ClientStreamBuilder {
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = timeout;
         self
+    }
+
+    /// Override the QUIC transport parameters used for this connection.
+    ///
+    /// The options are applied on top of the defaults this builder would otherwise use, so the
+    /// HTTP/3 specific stream limits are kept for every value that is left unset and explicit
+    /// values take precedence. See [`QuicTransportOptions::apply`] for the validation rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the options contain a value that cannot be used as a QUIC transport
+    /// parameter, e.g. a zero window or a window larger than a QUIC varint.
+    pub fn transport_options(mut self, options: &QuicTransportOptions) -> Result<Self, NetError> {
+        let mut transport_config = super::transport();
+        options.apply(&mut transport_config)?;
+        self.transport_config = Arc::new(transport_config);
+        Ok(self)
     }
 
     /// Creates a new H3Stream to the specified name_server
