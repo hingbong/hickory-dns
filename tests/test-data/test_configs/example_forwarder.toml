@@ -48,6 +48,12 @@ timeout = 20
 positive_max_ttl = 3600
 negative_max_ttl = 3600
 edns_payload_len = 1232
+## Optional cache TTL in seconds for lookups where no upstream nameserver answered at all, i.e. a
+## timeout or no usable upstream connection. When non-zero, the first lookup still waits for the
+## timeout, but the failure is remembered for this many seconds and later lookups for the same
+## query are answered immediately with SERVFAIL. The value is capped at 300 (RFC 2308 §7.1).
+## Set to 0 (the default) to disable, which preserves the classic behaviour of retrying every time.
+#servfail_cache_ttl = 30
 ## These options set the answer filter for the forwarder.  Anything listed in deny_answers will be
 ## blocked.  If you need to add a granular exception, you can place an address in allow_answers -
 ## that will override something in deny_answers.  For example, the following configuration blocks

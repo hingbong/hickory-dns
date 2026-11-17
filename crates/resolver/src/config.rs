@@ -615,6 +615,24 @@ pub struct ResolverOpts {
     /// `negative_max_ttl` instead. Otherwise, this will default to [`MAX_TTL`](crate::MAX_TTL) seconds.
     #[cfg_attr(feature = "serde", serde(with = "duration_opt"))]
     pub negative_max_ttl: Option<Duration>,
+    /// Optional cache TTL, in seconds, for lookups where no upstream nameserver returned a response.
+    ///
+    /// When this is non-zero, a final lookup failure caused by a request timeout or by the
+    /// resolver having no usable upstream connections is remembered for this many seconds, and
+    /// subsequent lookups for the same query are answered immediately with a synthetic
+    /// `SERVFAIL` instead of waiting for another upstream timeout. This is useful on small or
+    /// slow devices where a dead upstream would otherwise stall every client for the full
+    /// `timeout` (times `attempts`).
+    ///
+    /// Only failures that produced *no* response from any upstream are cached; errors that carry
+    /// an actual upstream response (busy, truncated, DNSSEC bogus, upstream `SERVFAIL` or
+    /// `REFUSED`, ...) are never cached by this mechanism.
+    ///
+    /// Defaults to 0, which disables the feature. The value is clamped to 300 seconds, the
+    /// maximum TTL recommended for failures by
+    /// [RFC 2308 section 7.1](https://datatracker.ietf.org/doc/html/rfc2308#section-7.1).
+    #[cfg_attr(feature = "serde", serde(default = "default_servfail_cache_ttl"))]
+    pub servfail_cache_ttl: u64,
     /// Number of concurrent requests per query
     ///
     /// Where more than one nameserver is configured, this configures the resolver to send queries
@@ -728,6 +746,7 @@ impl Default for ResolverOpts {
             negative_min_ttl: None,
             positive_max_ttl: None,
             negative_max_ttl: None,
+            servfail_cache_ttl: default_servfail_cache_ttl(),
             num_concurrent_reqs: default_num_concurrent_reqs(),
             max_active_requests: default_max_active_requests(),
 
@@ -761,6 +780,10 @@ fn default_timeout() -> Duration {
 
 fn default_connect_timeout() -> Duration {
     CONNECT_TIMEOUT
+}
+
+fn default_servfail_cache_ttl() -> u64 {
+    0
 }
 
 fn default_attempts() -> usize {
@@ -1230,6 +1253,8 @@ mod tests {
         assert_eq!(code.negative_min_ttl, json.negative_min_ttl);
         assert_eq!(code.positive_max_ttl, json.positive_max_ttl);
         assert_eq!(code.negative_max_ttl, json.negative_max_ttl);
+        assert_eq!(code.servfail_cache_ttl, json.servfail_cache_ttl);
+        assert_eq!(code.servfail_cache_ttl, 0);
         assert_eq!(code.num_concurrent_reqs, json.num_concurrent_reqs);
         assert_eq!(code.preserve_intermediates, json.preserve_intermediates);
         assert_eq!(code.try_tcp_on_error, json.try_tcp_on_error);

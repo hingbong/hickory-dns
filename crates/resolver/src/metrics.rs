@@ -159,6 +159,8 @@ pub(crate) struct CacheMetrics {
     pub(crate) cache_hit_duration: Histogram,
     pub(crate) cache_miss_duration: Histogram,
     pub(crate) cache_size: Gauge,
+    pub(crate) servfail_cache_insert: Counter,
+    pub(crate) servfail_cache_hit: Counter,
 }
 
 impl Default for CacheMetrics {
@@ -188,6 +190,16 @@ impl Default for CacheMetrics {
             Unit::Count,
             "Number of entries in the resolver response cache."
         );
+        describe_counter!(
+            SERVFAIL_CACHE_INSERT_TOTAL,
+            Unit::Count,
+            "Number of synthetic SERVFAIL entries inserted for lookups that produced no upstream response."
+        );
+        describe_counter!(
+            SERVFAIL_CACHE_HIT_TOTAL,
+            Unit::Count,
+            "Number of resolver requests answered from a synthetic SERVFAIL cache entry."
+        );
 
         Self {
             cache_hit: counter!(CACHE_HIT_TOTAL),
@@ -195,6 +207,8 @@ impl Default for CacheMetrics {
             cache_hit_duration: histogram!(CACHE_HIT_DURATION),
             cache_miss_duration: histogram!(CACHE_MISS_DURATION),
             cache_size: gauge!(RESPONSE_CACHE_SIZE),
+            servfail_cache_insert: counter!(SERVFAIL_CACHE_INSERT_TOTAL),
+            servfail_cache_hit: counter!(SERVFAIL_CACHE_HIT_TOTAL),
         }
     }
 }
@@ -216,6 +230,12 @@ pub const CACHE_MISS_DURATION: &str = "hickory_resolver_cache_miss_duration_seco
 
 /// Number of entries in the resolver response cache.
 pub const RESPONSE_CACHE_SIZE: &str = "hickory_resolver_response_cache_size";
+
+/// Number of synthetic SERVFAIL entries inserted for lookups that produced no upstream response.
+pub const SERVFAIL_CACHE_INSERT_TOTAL: &str = "hickory_resolver_servfail_cache_insert_total";
+
+/// Number of resolver requests answered from a synthetic SERVFAIL cache entry.
+pub const SERVFAIL_CACHE_HIT_TOTAL: &str = "hickory_resolver_servfail_cache_hit_total";
 
 /// Number of queries responses by name server, protocol, and status.
 pub const NAME_SERVER_QUERY_RESPONSES: &str = "hickory_resolver_name_server_query_responses_total";

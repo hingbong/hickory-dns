@@ -14,8 +14,7 @@ use tracing::{debug, error, info, trace, warn};
 
 #[cfg(feature = "metrics")]
 use crate::metrics::CatalogMetrics;
-#[cfg(feature = "__dnssec")]
-use crate::net::{DnsError, NetError};
+use crate::net::{DnsError, NetError, NoRecords};
 #[cfg(all(feature = "__dnssec", feature = "recursor"))]
 use crate::resolver::recursor;
 #[cfg(feature = "__dnssec")]
@@ -886,6 +885,16 @@ async fn build_forwarded_response(
 
             if e.is_nx_domain() {
                 response_meta.response_code = ResponseCode::NXDomain;
+            } else if let LookupError::NetError(NetError::Dns(DnsError::NoRecordsFound(
+                NoRecords { response_code, .. },
+            ))) = &e
+            {
+                // Honour the response code carried by the error instead of reporting every
+                // not-found error as NODATA. This is how the synthetic SERVFAIL cached for
+                // lookups where no upstream nameserver answered (see
+                // `ResolverOpts::servfail_cache_ttl`) reaches the client. For the ordinary
+                // NODATA case this is a no-op, as the response code is NoError already.
+                response_meta.response_code = *response_code;
             }
 
             let answers = match e.answers() {
@@ -1154,6 +1163,35 @@ mod tests {
             "Additionals section should not be empty, got {} records",
             additionals_count
         );
+    }
+
+    #[tokio::test]
+    async fn test_build_forwarded_response_preserves_error_response_code() {
+        let query = Query::new(Name::from_str("example.com.").unwrap(), RecordType::A);
+
+        let mut metadata = Metadata::new(1234, MessageType::Query, OpCode::Query);
+        metadata.recursion_desired = true;
+        let request = mock_request(metadata, query.clone());
+
+        // A synthetic SERVFAIL cached for a lookup where no upstream nameserver answered (see
+        // ResolverOpts::servfail_cache_ttl) must be reported as SERVFAIL, not as a NODATA
+        // response.
+        let error = LookupError::NetError(NetError::Dns(DnsError::NoRecordsFound(NoRecords::new(
+            query,
+            ResponseCode::ServFail,
+        ))));
+
+        let message = build_forwarded_response(
+            Err(error),
+            &request,
+            #[cfg(feature = "__dnssec")]
+            false,
+        )
+        .await;
+
+        assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
+        assert!(message.answers.is_empty());
+        assert!(message.authorities.is_empty());
     }
 
     #[tokio::test]

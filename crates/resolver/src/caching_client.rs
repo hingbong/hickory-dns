@@ -65,6 +65,10 @@ where
     cache: ResponseCache,
     client: C,
     preserve_intermediates: bool,
+    /// TTL for the opt-in cache of failures that produced no upstream response.
+    ///
+    /// Zero (the default) disables the failure cache, which is the historical behaviour.
+    servfail_cache_ttl: Duration,
     #[cfg(feature = "metrics")]
     cache_metrics: crate::metrics::CacheMetrics,
 }
@@ -91,9 +95,21 @@ where
             cache,
             client,
             preserve_intermediates,
+            servfail_cache_ttl: Duration::ZERO,
             #[cfg(feature = "metrics")]
             cache_metrics: crate::metrics::CacheMetrics::default(),
         }
+    }
+
+    /// Enable the opt-in cache for failures that produced no upstream response.
+    ///
+    /// With a non-zero `ttl`, a lookup that ends in [`NetError::Timeout`] or
+    /// [`NetError::NoConnections`] is remembered for `ttl`, and subsequent lookups for the same
+    /// query are answered immediately with a synthetic `SERVFAIL`. The first lookup still
+    /// returns the original error so that the timeout diagnostics are preserved.
+    pub(crate) fn with_servfail_cache_ttl(mut self, ttl: Duration) -> Self {
+        self.servfail_cache_ttl = ttl;
+        self
     }
 
     /// Perform a lookup against this caching client, looking first in the cache for a result
@@ -239,6 +255,13 @@ where
                 Err(no_records.into())
             }
             Err(err) => {
+                // Cache only failures where no upstream nameserver answered at all. The first
+                // lookup still returns the original error, so the timeout diagnostics are
+                // preserved; later lookups hit the synthetic SERVFAIL entry instead.
+                if client.should_cache_servfail(&err) {
+                    client.cache_servfail(&query);
+                }
+
                 #[cfg(feature = "metrics")]
                 client
                     .cache_metrics
@@ -270,7 +293,15 @@ where
     /// Check if this query is already cached
     fn lookup_from_cache(&self, query: &Query) -> Option<Result<Lookup, NetError>> {
         let now = Instant::now();
-        let message_res = self.cache.get(query, now)?;
+        let (message_res, synthetic_servfail) = self.cache.get_entry(query, now)?;
+
+        #[cfg(feature = "metrics")]
+        if synthetic_servfail {
+            self.cache_metrics.servfail_cache_hit.increment(1);
+        }
+        #[cfg(not(feature = "metrics"))]
+        let _ = synthetic_servfail;
+
         let message = match message_res {
             Ok(message) => message,
             Err(err) => return Some(Err(err)),
@@ -516,8 +547,30 @@ where
         result
     }
 
+    /// Returns whether a lookup failure should be remembered in the failure cache.
+    ///
+    /// Only failures where no upstream nameserver produced a response are eligible: a timeout,
+    /// or the resolver not having any usable connection. Errors that carry a real upstream
+    /// response (`Busy`, `Truncated`, DNSSEC bogus, upstream `SERVFAIL`/`REFUSED`, ...) are
+    /// deliberately excluded: caching them would change their meaning, and would conflate them
+    /// with the synthetic `SERVFAIL` produced elsewhere when request de-duplication overflows.
+    fn should_cache_servfail(&self, err: &NetError) -> bool {
+        !self.servfail_cache_ttl.is_zero()
+            && matches!(err, NetError::Timeout | NetError::NoConnections)
+    }
+
+    /// Store a synthetic `SERVFAIL` for a query that failed without any upstream response.
+    fn cache_servfail(&self, query: &Query) {
+        self.cache
+            .insert_servfail(query.clone(), self.servfail_cache_ttl, Instant::now());
+
+        #[cfg(feature = "metrics")]
+        self.cache_metrics.servfail_cache_insert.increment(1);
+    }
+
     /// Flushes/Removes all entries from the cache
     pub fn clear_cache(&self) {
+        // Also drops the synthetic SERVFAIL entries, as they live in the same table.
         self.cache.clear();
     }
 
@@ -662,6 +715,116 @@ mod tests {
                 RData::A(A::new(127, 0, 0, 1))
             )]
         );
+    }
+
+    /// Returns true if `err` is the synthetic SERVFAIL produced by the failure cache.
+    fn is_synthetic_servfail(err: &NetError) -> bool {
+        matches!(
+            err,
+            NetError::Dns(DnsError::NoRecordsFound(no_records))
+                if no_records.response_code == ResponseCode::ServFail
+        )
+    }
+
+    #[test]
+    fn test_servfail_cache_caches_timeout() {
+        subscribe();
+        let query = Query::new(Name::root(), RecordType::A);
+        let cache = ResponseCache::new(1, TtlConfig::default());
+        // Only a single timeout is queued. If the client queried the upstream a second time, the
+        // mock would fall back to an empty (non-SERVFAIL) response and the assertions below would
+        // fail.
+        let client = CachingClient::with_cache(cache, mock(vec![Err(NetError::Timeout)]), false)
+            .with_servfail_cache_ttl(Duration::from_secs(30));
+
+        let err = block_on(CachingClient::inner_lookup(
+            query.clone(),
+            DnsRequestOptions::default(),
+            client.clone(),
+            vec![],
+            DepthTracker::default(),
+        ))
+        .unwrap_err();
+        // The first lookup returns the original error, preserving the timeout diagnostics.
+        assert!(matches!(err, NetError::Timeout), "got {err:?}");
+
+        let err = block_on(CachingClient::inner_lookup(
+            query,
+            DnsRequestOptions::default(),
+            client,
+            vec![],
+            DepthTracker::default(),
+        ))
+        .unwrap_err();
+        assert!(is_synthetic_servfail(&err), "got {err:?}");
+        let NetError::Dns(DnsError::NoRecordsFound(no_records)) = &err else {
+            panic!("expected NoRecordsFound, got {err:?}");
+        };
+        assert_eq!(no_records.negative_ttl, Some(30));
+    }
+
+    #[test]
+    fn test_servfail_cache_disabled_by_default() {
+        subscribe();
+        let query = Query::new(Name::root(), RecordType::A);
+        let cache = ResponseCache::new(1, TtlConfig::default());
+        // Two timeouts are queued: with the failure cache disabled every lookup must reach the
+        // upstream, so both lookups observe the timeout.
+        let client = CachingClient::with_cache(
+            cache,
+            mock(vec![Err(NetError::Timeout), Err(NetError::Timeout)]),
+            false,
+        );
+
+        for _ in 0..2 {
+            let err = block_on(CachingClient::inner_lookup(
+                query.clone(),
+                DnsRequestOptions::default(),
+                client.clone(),
+                vec![],
+                DepthTracker::default(),
+            ))
+            .unwrap_err();
+            assert!(matches!(err, NetError::Timeout), "got {err:?}");
+        }
+    }
+
+    #[test]
+    fn test_servfail_cache_ignores_upstream_errors() {
+        subscribe();
+        let query = Query::new(Name::root(), RecordType::A);
+
+        for err in [NetError::Busy, NetError::Truncated] {
+            let cache = ResponseCache::new(1, TtlConfig::default());
+            // Only the upstream error is queued; a second upstream call falls back to an empty
+            // response, which is not a SERVFAIL, proving that the error was not cached.
+            let client = CachingClient::with_cache(cache, mock(vec![Err(err.clone())]), false)
+                .with_servfail_cache_ttl(Duration::from_secs(30));
+
+            let first = block_on(CachingClient::inner_lookup(
+                query.clone(),
+                DnsRequestOptions::default(),
+                client.clone(),
+                vec![],
+                DepthTracker::default(),
+            ))
+            .unwrap_err();
+            assert_eq!(first.to_string(), err.to_string(), "got {first:?}");
+
+            let second = block_on(CachingClient::inner_lookup(
+                query.clone(),
+                DnsRequestOptions::default(),
+                client,
+                vec![],
+                DepthTracker::default(),
+            ))
+            .unwrap_err();
+            assert!(!is_synthetic_servfail(&second), "got {second:?}");
+            let NetError::Dns(DnsError::NoRecordsFound(no_records)) = &second else {
+                panic!("expected NoRecordsFound from the empty response, got {second:?}");
+            };
+            assert_eq!(no_records.response_code, ResponseCode::NoError);
+        }
     }
 
     #[allow(clippy::unnecessary_wraps)]

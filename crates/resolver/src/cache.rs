@@ -15,7 +15,7 @@ use crate::{
     config,
     net::{DnsError, NetError, NoRecords},
     proto::{
-        op::{Message, Query},
+        op::{Message, Query, ResponseCode},
         rr::RecordType,
     },
 };
@@ -97,6 +97,7 @@ impl ResponseCache {
                 valid_until: entry_opt.map_or(valid_until, |entry| {
                     entry.value().valid_until.min(valid_until)
                 }),
+                synthetic_servfail: false,
             });
         } else {
             self.cache.insert(
@@ -105,18 +106,62 @@ impl ResponseCache {
                     result: Arc::new(result),
                     original_time: now,
                     valid_until,
+                    synthetic_servfail: false,
                 },
             );
         }
     }
 
+    /// Insert a synthetic `SERVFAIL` for a query that failed without any upstream response.
+    ///
+    /// This is used to implement the opt-in failure cache: when a lookup ends in
+    /// [`NetError::Timeout`] or [`NetError::NoConnections`], the failure is cached as a
+    /// [`DnsError::NoRecordsFound`] with [`ResponseCode::ServFail`], so subsequent lookups for
+    /// the same query fail fast instead of waiting for the upstream timeout again.
+    ///
+    /// The TTL is deliberately *not* clamped by the cache's configured
+    /// [`negative_min_ttl`](crate::config::ResolverOpts::negative_min_ttl): the point of this
+    /// entry is the operator-configured failure TTL. It is however clamped to
+    /// [`MAX_SERVFAIL_CACHE_TTL`] per [RFC 2308 section 7.1](https://datatracker.ietf.org/doc/html/rfc2308#section-7.1).
+    /// A zero TTL disables the insertion.
+    pub(crate) fn insert_servfail(&self, query: Query, ttl: Duration, now: Instant) {
+        let ttl = ttl.min(MAX_SERVFAIL_CACHE_TTL);
+        if ttl.is_zero() {
+            return;
+        }
+
+        let mut no_records = NoRecords::new(query.clone(), ResponseCode::ServFail);
+        let negative_ttl = u32::try_from(ttl.as_secs()).unwrap_or(u32::MAX);
+        no_records.negative_ttl = Some(negative_ttl);
+
+        self.cache.insert(
+            query,
+            Entry {
+                result: Arc::new(Err(NetError::Dns(DnsError::NoRecordsFound(no_records)))),
+                original_time: now,
+                valid_until: now + ttl,
+                synthetic_servfail: true,
+            },
+        );
+    }
+
     /// Try to retrieve a cached response with the given query.
     pub fn get(&self, query: &Query, now: Instant) -> Option<Result<Message, NetError>> {
+        self.get_entry(query, now).map(|(result, _)| result)
+    }
+
+    /// Try to retrieve a cached response together with whether it is a synthetic `SERVFAIL`
+    /// entry created by [`insert_servfail`](Self::insert_servfail).
+    pub(crate) fn get_entry(
+        &self,
+        query: &Query,
+        now: Instant,
+    ) -> Option<(Result<Message, NetError>, bool)> {
         let entry = self.cache.get(query)?;
         if !entry.is_current(now) {
             return None;
         }
-        Some(entry.updated_ttl(now))
+        Some((entry.updated_ttl(now), entry.synthetic_servfail))
     }
 
     /// Clamp all record TTLs to `[positive_min_ttl, positive_max_ttl]` and return
@@ -225,6 +270,9 @@ struct Entry {
     result: Arc<Result<Message, NetError>>,
     original_time: Instant,
     valid_until: Instant,
+    /// Whether this entry is a synthetic `SERVFAIL` created by
+    /// [`ResponseCache::insert_servfail`], rather than a real upstream answer.
+    synthetic_servfail: bool,
 }
 
 impl Entry {
@@ -531,6 +579,14 @@ mod ttl_config_deserialize {
 /// upper bound on received TTLs.
 pub const MAX_TTL: u32 = 86400_u32;
 
+/// Maximum TTL for synthetic `SERVFAIL` entries inserted by
+/// [`ResponseCache::insert_servfail`].
+///
+/// [RFC 2308, section 7.1](https://datatracker.ietf.org/doc/html/rfc2308#section-7.1) recommends
+/// that a server failing due to a timeout should not have a negative caching TTL longer than 300
+/// seconds.
+const MAX_SERVFAIL_CACHE_TTL: Duration = Duration::from_secs(300);
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -568,6 +624,7 @@ mod tests {
             result: Err(NetError::from("test error")).into(),
             original_time: now,
             valid_until: future,
+            synthetic_servfail: false,
         };
 
         assert!(entry.is_current(now));
@@ -957,6 +1014,108 @@ mod tests {
 
         // Cache should be expired
         assert!(cache.get(&query, now + Duration::from_secs(11)).is_none());
+    }
+
+    #[test]
+    fn test_insert_servfail() {
+        let now = Instant::now();
+
+        let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+        // A negative_min_ttl far above the configured failure TTL must not override it: the
+        // operator-configured failure TTL is authoritative for these synthetic entries.
+        let ttls = TtlConfig::from(TtlBounds {
+            negative_min_ttl: Some(Duration::from_secs(600)),
+            ..TtlBounds::default()
+        });
+        let cache = ResponseCache::new(1, ttls);
+
+        cache.insert_servfail(query.clone(), Duration::from_secs(30), now);
+
+        // Within the TTL this is a hit, flagged as synthetic, with a SERVFAIL response code.
+        let (result, synthetic_servfail) = cache.get_entry(&query, now).unwrap();
+        assert!(synthetic_servfail);
+        let NetError::Dns(DnsError::NoRecordsFound(no_records)) = result.unwrap_err() else {
+            panic!("expected NoRecordsFound");
+        };
+        assert_eq!(no_records.response_code, ResponseCode::ServFail);
+        assert_eq!(no_records.negative_ttl, Some(30));
+        assert_eq!(*no_records.query, query);
+
+        // The plain `get` path returns the same synthetic error.
+        let NetError::Dns(DnsError::NoRecordsFound(no_records)) =
+            cache.get(&query, now).unwrap().unwrap_err()
+        else {
+            panic!("expected NoRecordsFound");
+        };
+        assert_eq!(no_records.response_code, ResponseCode::ServFail);
+
+        // The entry lifetime is exactly the requested TTL, not the clamped negative minimum.
+        assert_eq!(
+            cache.cache.get(&query).unwrap().valid_until,
+            now + Duration::from_secs(30)
+        );
+
+        // Past the TTL this is a miss.
+        assert!(
+            cache
+                .get_entry(&query, now + Duration::from_secs(31))
+                .is_none()
+        );
+        assert!(cache.get(&query, now + Duration::from_secs(31)).is_none());
+    }
+
+    #[test]
+    fn test_insert_servfail_clamps_ttl() {
+        let now = Instant::now();
+
+        let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+        let cache = ResponseCache::new(1, TtlConfig::default());
+
+        // RFC 2308 section 7.1 caps the failure TTL at 300 seconds.
+        cache.insert_servfail(query.clone(), Duration::from_secs(3600), now);
+
+        assert_eq!(
+            cache.cache.get(&query).unwrap().valid_until,
+            now + Duration::from_secs(300)
+        );
+        assert!(cache.get(&query, now + Duration::from_secs(299)).is_some());
+        assert!(cache.get(&query, now + Duration::from_secs(301)).is_none());
+    }
+
+    #[test]
+    fn test_insert_servfail_zero_ttl_is_disabled() {
+        let now = Instant::now();
+
+        let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+        let cache = ResponseCache::new(1, TtlConfig::default());
+
+        cache.insert_servfail(query.clone(), Duration::ZERO, now);
+        assert!(cache.get_entry(&query, now).is_none());
+    }
+
+    #[test]
+    fn test_clear_removes_servfail_and_plain_inserts_are_not_synthetic() {
+        let now = Instant::now();
+
+        let query = Query::new(Name::from_str("www.example.com.").unwrap(), RecordType::A);
+        let cache = ResponseCache::new(1, TtlConfig::default());
+
+        cache.insert_servfail(query.clone(), Duration::from_secs(30), now);
+        assert!(cache.get_entry(&query, now).is_some());
+
+        cache.clear();
+        assert!(cache.get_entry(&query, now).is_none());
+
+        let mut message = Message::response(0, OpCode::Query);
+        message.add_answer(Record::from_rdata(
+            query.name.clone(),
+            10,
+            RData::A(A::new(127, 0, 0, 1)),
+        ));
+        cache.insert(query.clone(), Ok(message), now);
+        let (result, synthetic_servfail) = cache.get_entry(&query, now).unwrap();
+        assert!(result.is_ok());
+        assert!(!synthetic_servfail);
     }
 
     #[test]

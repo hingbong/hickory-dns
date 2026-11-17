@@ -12,6 +12,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use futures_util::{
     FutureExt,
@@ -559,7 +560,8 @@ impl<P: ConnectionProvider> ResolverBuilder<P> {
             TtlConfig::from_opts(&context.options),
         );
         let client_cache =
-            CachingClient::with_cache(cache, either, context.options.preserve_intermediates);
+            CachingClient::with_cache(cache, either, context.options.preserve_intermediates)
+                .with_servfail_cache_ttl(Duration::from_secs(context.options.servfail_cache_ttl));
 
         let hosts = Arc::new(match context.options.use_hosts_file {
             ResolveHosts::Always | ResolveHosts::Auto => Hosts::from_system().unwrap_or_default(),

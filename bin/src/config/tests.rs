@@ -11,7 +11,7 @@ use toml::{Table, Value};
 
 use super::{Config, ServerZoneConfig};
 #[cfg(feature = "resolver")]
-use super::{FileConfig, ServerStoreConfig, ZoneTypeConfig};
+use super::{ExternalStoreConfig, FileConfig, ServerStoreConfig, ZoneTypeConfig};
 
 #[test]
 fn test_read_config() {
@@ -574,6 +574,71 @@ fn chained_store_config_error_message() {
         Ok(val) => panic!("expected error value; got ok: {val:?}"),
         Err(e) => assert!(e.to_string().contains("unknown field `rotocol`")),
     }
+}
+
+#[cfg(feature = "resolver")]
+#[test]
+fn forward_store_servfail_cache_ttl() {
+    const BASE: &str = r#"[[zones]]
+zone = "."
+
+[zones.stores]
+type = "forward"
+
+[[zones.stores.name_servers]]
+ip = "192.0.2.1"
+trust_negative_responses = false
+connections = [{ protocol = "udp" }]
+"#;
+
+    fn parsed_ttl(toml: &str) -> Result<u64, String> {
+        let config = toml::from_str::<Config>(toml).map_err(|e| e.to_string())?;
+        let ZoneTypeConfig::External(config) = &config.zones[0].zone_type_config else {
+            panic!("expected external zone type");
+        };
+        let ExternalStoreConfig::Forward(config) = &config.stores[0] else {
+            panic!("expected forward store");
+        };
+        // The options table is optional, so treat a missing table as all-default options.
+        Ok(config
+            .options
+            .as_ref()
+            .map_or(0, |options| options.servfail_cache_ttl))
+    }
+
+    // Unset means disabled, i.e. the historical behaviour.
+    assert_eq!(parsed_ttl(BASE).unwrap(), 0);
+    assert_eq!(
+        parsed_ttl(BASE.replace(
+            "connections = [{ protocol = \"udp\" }]",
+            "connections = [{ protocol = \"udp\" }]\n\n[zones.stores.options]",
+        ))
+        .unwrap(),
+        0
+    );
+
+    // A configured value is honored.
+    assert_eq!(
+        parsed_ttl(&format!(
+            "{BASE}\n[zones.stores.options]\nservfail_cache_ttl = 30\n"
+        ))
+        .unwrap(),
+        30
+    );
+
+    // Negative and non-integer values are rejected rather than silently accepted.
+    assert!(
+        parsed_ttl(&format!(
+            "{BASE}\n[zones.stores.options]\nservfail_cache_ttl = -1\n"
+        ))
+        .is_err()
+    );
+    assert!(
+        parsed_ttl(&format!(
+            "{BASE}\n[zones.stores.options]\nservfail_cache_ttl = \"30\"\n"
+        ))
+        .is_err()
+    );
 }
 
 #[cfg(feature = "resolver")]
